@@ -580,7 +580,7 @@
 ;b %R:1911% *
 "EnableSymbolDownload"=dword:00000001
 ;b %R:1912% *
-"PinnedItemsActAsQuickLaunch"=dword:00000000
+"PinnedItemsActAsQuickLaunch"=dword:00000001
 ;b %R:1913% *
 "RemoveExtraGapAroundPinnedItems"=dword:00000000
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\ExplorerPatcher]

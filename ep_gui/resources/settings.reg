@@ -753,7 +753,7 @@
 "EnableSymbolDownload"=dword:00000001
 ;s Advanced_Windows10 IsOldTaskbar
 ;b %R:1912% *
-"PinnedItemsActAsQuickLaunch"=dword:00000000
+"PinnedItemsActAsQuickLaunch"=dword:00000001
 ;b %R:1913% *
 "RemoveExtraGapAroundPinnedItems"=dword:00000000
 ;g Advanced_Windows10

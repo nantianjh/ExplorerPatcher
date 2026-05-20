@@ -141,7 +141,7 @@ WCHAR* wszWeatherLanguage = NULL;
 WCHAR* wszEPWeatherKillswitch = NULL;
 HANDLE hEPWeatherKillswitch = NULL;
 DWORD bWasPinnedItemsActAsQuickLaunch = FALSE;
-DWORD bPinnedItemsActAsQuickLaunch = FALSE;
+DWORD bPinnedItemsActAsQuickLaunch = TRUE;
 DWORD bWasRemoveExtraGapAroundPinnedItems = FALSE;
 DWORD bRemoveExtraGapAroundPinnedItems = FALSE;
 DWORD dwUndeadStartCorner = FALSE;
@@ -1058,6 +1058,110 @@ typedef enum eTBGROUPTYPE
     TBG_GHOST,
 } TBGROUPTYPE;
 
+HWND Win10TaskbarHooks_FindDescendantByClass(HWND hWndRoot, LPCWSTR pszClassName)
+{
+    if (!hWndRoot)
+    {
+        return NULL;
+    }
+
+    HWND hWndChild = NULL;
+    while ((hWndChild = FindWindowExW(hWndRoot, hWndChild, NULL, NULL)))
+    {
+        WCHAR szClassName[128];
+        szClassName[0] = L'\0';
+        GetClassNameW(hWndChild, szClassName, ARRAYSIZE(szClassName));
+        if (!wcscmp(szClassName, pszClassName))
+        {
+            return hWndChild;
+        }
+
+        HWND hWndMatch = Win10TaskbarHooks_FindDescendantByClass(hWndChild, pszClassName);
+        if (hWndMatch)
+        {
+            return hWndMatch;
+        }
+    }
+
+    return NULL;
+}
+
+BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList, int rowColSpan)
+{
+    RECT rc;
+    if (!hWndTaskList || !GetClientRect(hWndTaskList, &rc))
+    {
+        return FALSE;
+    }
+
+    int cx = rc.right - rc.left;
+    int cy = rc.bottom - rc.top;
+    if (cx <= 0 || cy <= 0 || rowColSpan <= 0)
+    {
+        return FALSE;
+    }
+
+    int minorAxisSpan = cx >= cy ? cy : cx;
+    return minorAxisSpan + 2 >= rowColSpan * 2;
+}
+
+BOOL Win10TaskbarHooks_HasMultiRowTaskList(int rowColSpan)
+{
+    HWND hWndTray = FindWindowExW(NULL, NULL, L"Shell_TrayWnd", NULL);
+    if (Win10TaskbarHooks_IsTaskListMultiRow(
+        Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass"),
+        rowColSpan))
+    {
+        return TRUE;
+    }
+
+    hWndTray = NULL;
+    while ((hWndTray = FindWindowExW(NULL, hWndTray, L"Shell_SecondaryTrayWnd", NULL)))
+    {
+        if (Win10TaskbarHooks_IsTaskListMultiRow(
+            Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass"),
+            rowColSpan))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+BOOL Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
+{
+    if (!bPinnedItemsActAsQuickLaunch || rowColBegin != 0)
+    {
+        return FALSE;
+    }
+
+    if (groupType != TBG_SWITCHER && groupType != TBG_GLOM)
+    {
+        return FALSE;
+    }
+
+    int rowColSpan = rowColEnd - rowColBegin;
+    if (rowColSpan < 0)
+    {
+        rowColSpan = -rowColSpan;
+    }
+
+    return Win10TaskbarHooks_HasMultiRowTaskList(rowColSpan);
+}
+
+int Win10TaskbarHooks_GetNonFittingSpan(int rowColBegin, int rowColEnd)
+{
+    int rowColSpan = rowColEnd - rowColBegin;
+    if (rowColSpan < 0)
+    {
+        rowColSpan = -rowColSpan;
+    }
+
+    int nonFittingSpan = rowColSpan * 1024;
+    return nonFittingSpan > 32767 ? nonFittingSpan : 32767;
+}
+
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
 int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
@@ -1074,6 +1178,14 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     {
         *pGroupType = TBG_GHOST;
         bTypeModified = TRUE;
+    }
+    if (Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(lastGroupType, rowColBegin, rowColEnd))
+    {
+        if (pcxShrinkable)
+        {
+            *pcxShrinkable = 0;
+        }
+        return Win10TaskbarHooks_GetNonFittingSpan(rowColBegin, rowColEnd);
     }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
@@ -1103,7 +1215,7 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (bRemoveExtraGapAroundPinnedItems)
+    if (bRemoveExtraGapAroundPinnedItems || bPinnedItemsActAsQuickLaunch)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))
@@ -6320,7 +6432,7 @@ void WINAPI LoadSettings(LPARAM lParam)
             }
 #endif
         }
-        dwTemp = FALSE;
+        dwTemp = TRUE;
         dwSize = sizeof(DWORD);
         RegQueryValueExW(
             hKey,
@@ -6334,7 +6446,7 @@ void WINAPI LoadSettings(LPARAM lParam)
         {
             //if (dwTemp != bPinnedItemsActAsQuickLaunch)
             {
-                bPinnedItemsActAsQuickLaunch = dwTemp;
+                bPinnedItemsActAsQuickLaunch = TRUE;
                 bWasPinnedItemsActAsQuickLaunch = TRUE;
                 //dwRefreshUIMask |= REFRESHUI_TASKBAR;
             }

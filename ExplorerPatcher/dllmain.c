@@ -3,7 +3,9 @@
 #endif
 #include <initguid.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <time.h>
 #include <Windows.h>
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
@@ -189,6 +191,164 @@ void* P_Icon_Dark_Widgets = NULL;
 DWORD S_Icon_Dark_Widgets = 0;
 
 BOOL g_bIsDesktopRaised = FALSE;
+
+SRWLOCK g_epDebugLogLock = SRWLOCK_INIT;
+WCHAR g_epDebugLogPath[MAX_PATH] = { 0 };
+LONG g_epDebugLogReady = 0;
+PVOID g_epDebugVectoredHandler = NULL;
+
+void EPDebugLogInitPath()
+{
+    if (InterlockedCompareExchange(&g_epDebugLogReady, 1, 1))
+    {
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_epDebugLogLock);
+    if (!g_epDebugLogPath[0])
+    {
+        WCHAR dir[MAX_PATH];
+        dir[0] = L'\0';
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, SHGFP_TYPE_CURRENT, dir)))
+        {
+            PathAppendW(dir, L"ExplorerPatcher");
+            CreateDirectoryW(dir, NULL);
+            PathAppendW(dir, L"ep_debug.log");
+            wcscpy_s(g_epDebugLogPath, ARRAYSIZE(g_epDebugLogPath), dir);
+        }
+    }
+    InterlockedExchange(&g_epDebugLogReady, g_epDebugLogPath[0] ? 1 : 0);
+    ReleaseSRWLockExclusive(&g_epDebugLogLock);
+}
+
+void EPDebugLogWrite(LPCWSTR format, ...)
+{
+    EPDebugLogInitPath();
+    if (!g_epDebugLogPath[0])
+    {
+        return;
+    }
+
+    WCHAR message[2048];
+    va_list args;
+    va_start(args, format);
+    vswprintf_s(message, ARRAYSIZE(message), format, args);
+    va_end(args);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    WCHAR line[2600];
+    swprintf_s(
+        line,
+        ARRAYSIZE(line),
+        L"%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu tid=%lu %s\r\n",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        message
+    );
+
+    char utf8[8192];
+    int cb = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, ARRAYSIZE(utf8), NULL, NULL);
+    if (cb <= 1)
+    {
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_epDebugLogLock);
+    HANDLE hFile = CreateFileW(
+        g_epDebugLogPath,
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        WriteFile(hFile, utf8, cb - 1, &written, NULL);
+        CloseHandle(hFile);
+    }
+    ReleaseSRWLockExclusive(&g_epDebugLogLock);
+
+    OutputDebugStringW(line);
+}
+
+void EPDebugLogModuleForAddress(PVOID address, WCHAR* modulePath, DWORD cchModulePath)
+{
+    modulePath[0] = L'\0';
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) && mbi.AllocationBase)
+    {
+        GetModuleFileNameW((HMODULE)mbi.AllocationBase, modulePath, cchModulePath);
+    }
+}
+
+LONG WINAPI EPDebugVectoredExceptionHandler(PEXCEPTION_POINTERS exceptionInfo)
+{
+    if (!exceptionInfo || !exceptionInfo->ExceptionRecord)
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_STACK_OVERFLOW)
+    {
+        static LONG count = 0;
+        LONG current = InterlockedIncrement(&count);
+        if (current <= 32)
+        {
+            WCHAR modulePath[MAX_PATH];
+            EPDebugLogModuleForAddress(exceptionInfo->ExceptionRecord->ExceptionAddress, modulePath, ARRAYSIZE(modulePath));
+            EPDebugLogWrite(
+                L"exception first-chance code=0x%08lx flags=0x%08lx address=%p module=\"%s\" count=%ld",
+                code,
+                exceptionInfo->ExceptionRecord->ExceptionFlags,
+                exceptionInfo->ExceptionRecord->ExceptionAddress,
+                modulePath,
+                current
+            );
+        }
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI EPDebugUnhandledExceptionFilter(PEXCEPTION_POINTERS exceptionInfo)
+{
+    if (exceptionInfo && exceptionInfo->ExceptionRecord)
+    {
+        WCHAR modulePath[MAX_PATH];
+        EPDebugLogModuleForAddress(exceptionInfo->ExceptionRecord->ExceptionAddress, modulePath, ARRAYSIZE(modulePath));
+        EPDebugLogWrite(
+            L"exception unhandled code=0x%08lx flags=0x%08lx address=%p module=\"%s\"",
+            exceptionInfo->ExceptionRecord->ExceptionCode,
+            exceptionInfo->ExceptionRecord->ExceptionFlags,
+            exceptionInfo->ExceptionRecord->ExceptionAddress,
+            modulePath
+        );
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void EPDebugInstallExceptionLogging()
+{
+    if (!g_epDebugVectoredHandler)
+    {
+        g_epDebugVectoredHandler = AddVectoredExceptionHandler(1, EPDebugVectoredExceptionHandler);
+    }
+    SetUnhandledExceptionFilter(EPDebugUnhandledExceptionFilter);
+    EPDebugLogWrite(L"debug logging initialized path=\"%s\"", g_epDebugLogPath);
+}
 
 #include "utility.h"
 #include "Localization.h"
@@ -741,6 +901,7 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUPS_REGPATH TEXT(REGPATH) TEXT("\\LauncherGroups")
 #define EP_LAUNCHER_GROUP_MAX_ITEMS 16
 #define EP_LAUNCHER_GROUP_CLASS_NAME L"EP_LauncherGroupWindow_" _T(EP_CLSID)
+#define EP_LAUNCHER_GROUP_SHOW_MENU_MSG (WM_APP + 0x512)
 #define EP_LAUNCHER_GROUP_MENU_BASE 1000
 
 typedef struct _LauncherGroupItem
@@ -1067,6 +1228,7 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
         return;
     }
 
+    EPDebugLogWrite(L"launcher-group menu enter hwnd=%p group=\"%s\" items=%lu", hWnd, group->szName, group->cItems);
     group->bMenuActive = TRUE;
     hMenu = CreatePopupMenu();
     if (!hMenu)
@@ -1090,11 +1252,13 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
     if (cmd >= EP_LAUNCHER_GROUP_MENU_BASE && cmd < EP_LAUNCHER_GROUP_MENU_BASE + (int)group->cItems)
     {
         LauncherGroupItem* item = &group->items[cmd - EP_LAUNCHER_GROUP_MENU_BASE];
+        EPDebugLogWrite(L"launcher-group launch group=\"%s\" item=\"%s\" path=\"%s\"", group->szName, item->szName, item->szPath);
         ShellExecuteW(NULL, L"open", item->szPath, item->szArgs[0] ? item->szArgs : NULL, NULL, SW_SHOWNORMAL);
     }
 
     ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
     group->bMenuActive = FALSE;
+    EPDebugLogWrite(L"launcher-group menu leave hwnd=%p group=\"%s\" cmd=%d", hWnd, group->szName, cmd);
 }
 
 LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1105,18 +1269,22 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     case WM_CREATE:
         group = (LauncherGroup*)((CREATESTRUCTW*)lParam)->lpCreateParams;
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, (LONG_PTR)group);
+        EPDebugLogWrite(L"launcher-group create hwnd=%p group=\"%s\"", hWnd, group ? group->szName : L"");
+        return 0;
+    case EP_LAUNCHER_GROUP_SHOW_MENU_MSG:
+        LauncherGroups_ShowMenu(hWnd, group);
         return 0;
     case WM_SYSCOMMAND:
         if ((wParam & 0xFFF0) == SC_RESTORE || (wParam & 0xFFF0) == SC_MAXIMIZE)
         {
-            LauncherGroups_ShowMenu(hWnd, group);
+            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
             return 0;
         }
         break;
     case WM_ACTIVATE:
         if (LOWORD(wParam) != WA_INACTIVE && group)
         {
-            LauncherGroups_ShowMenu(hWnd, group);
+            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
             return 0;
         }
         break;
@@ -1141,8 +1309,10 @@ DWORD LauncherGroupsThread(DWORD unused)
 
     if (!LauncherGroups_LoadFromRegistry())
     {
+        EPDebugLogWrite(L"launcher-groups none");
         return 0;
     }
+    EPDebugLogWrite(L"launcher-groups thread start");
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = LauncherGroups_WndProc;
@@ -1172,6 +1342,7 @@ DWORD LauncherGroupsThread(DWORD unused)
             SendMessageW(group->hWnd, WM_SETICON, ICON_SMALL, (LPARAM)group->hIconSmall);
             SendMessageW(group->hWnd, WM_SETICON, ICON_BIG, (LPARAM)group->hIconLarge);
             ShowWindow(group->hWnd, SW_SHOWMINNOACTIVE);
+            EPDebugLogWrite(L"launcher-group window shown hwnd=%p group=\"%s\"", group->hWnd, group->szName);
         }
     }
 
@@ -1413,9 +1584,8 @@ HRESULT(STDMETHODCALLTYPE *CTaskGroup_DoesWindowMatchFunc)(ITaskGroup* pTaskGrou
 HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup, HWND hCompareWnd, ITEMIDLIST* pCompareItemIdList,
     WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, LONG_PTR** p_task_item)
 {
-    wprintf(L"CTaskGroup_DoesWindowMatchHook called for hwnd 0x%p\n", hCompareWnd);
     HRESULT hr = CTaskGroup_DoesWindowMatchFunc(pTaskGroup, hCompareWnd, pCompareItemIdList, pCompareAppId, pnMatch, p_task_item);
-    if (bPinnedItemsActAsQuickLaunch && SUCCEEDED(hr)
+    if (bPinnedItemsActAsQuickLaunch && SUCCEEDED(hr) && pnMatch
         && (*pnMatch == WMC_MatchAppID || *pnMatch == WMC_MatchShortcutIDListByAppID || *pnMatch == WMC_MatchShortcutIDList))
     {
         BOOL bDontGroup = FALSE;
@@ -1428,7 +1598,24 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
         }
         if (bDontGroup)
         {
-            hr = E_FAIL;
+            HDPA hdpaItems = *(HDPA*)((PBYTE)pTaskGroup - 16 /*sizeof(CTaskUnknown)*/ + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
+            int itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
+            EPDebugLogWrite(
+                L"taskgroup no-match-for-quick-launch hwnd=%p match=%d itemCount=%d appid=\"%s\"",
+                hCompareWnd,
+                pnMatch ? *pnMatch : -1,
+                itemCount,
+                pCompareAppId ? pCompareAppId : L""
+            );
+            if (pnMatch)
+            {
+                *pnMatch = WMC_None;
+            }
+            if (p_task_item)
+            {
+                *p_task_item = NULL;
+            }
+            hr = S_OK;
         }
     }
     return hr;
@@ -1580,16 +1767,23 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList()
     return FALSE;
 }
 
+BOOL bWin10TaskbarHooksSawLauncherRow = FALSE;
 BOOL bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
 
 BOOL Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
 {
-    if (groupType == TBG_LAUNCHER && rowColBegin == 0)
+    if (groupType == TBG_LAUNCHER)
     {
-        bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
+        if (rowColBegin == 0)
+        {
+            bWin10TaskbarHooksSawLauncherRow = FALSE;
+            bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
+        }
+        bWin10TaskbarHooksSawLauncherRow = TRUE;
+        return FALSE;
     }
 
-    if (!bPinnedItemsActAsQuickLaunch || rowColBegin <= 0 || bWin10TaskbarHooksWrappedFirstWindowRow)
+    if (!bPinnedItemsActAsQuickLaunch || !bWin10TaskbarHooksSawLauncherRow || bWin10TaskbarHooksWrappedFirstWindowRow)
     {
         return FALSE;
     }
@@ -1637,10 +1831,33 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
             *pcxShrinkable = 0;
         }
         bWin10TaskbarHooksWrappedFirstWindowRow = TRUE;
-        return Win10TaskbarHooks_GetNonFittingSpan(rowColBegin, rowColEnd);
+        int nonFittingSpan = Win10TaskbarHooks_GetNonFittingSpan(rowColBegin, rowColEnd);
+        EPDebugLogWrite(
+            L"taskbtn force-window-wrap type=%d begin=%d end=%d span=%d",
+            lastGroupType,
+            rowColBegin,
+            rowColEnd,
+            nonFittingSpan
+        );
+        return nonFittingSpan;
     }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
+    static LONG spanLogCount = 0;
+    LONG currentSpanLogCount = InterlockedIncrement(&spanLogCount);
+    if (currentSpanLogCount <= 1000)
+    {
+        EPDebugLogWrite(
+            L"taskbtn span type=%d begin=%d end=%d ret=%d shrink=%d sawLauncher=%d wrapped=%d",
+            lastGroupType,
+            rowColBegin,
+            rowColEnd,
+            ret,
+            pcxShrinkable ? *pcxShrinkable : -1,
+            bWin10TaskbarHooksSawLauncherRow,
+            bWin10TaskbarHooksWrappedFirstWindowRow
+        );
+    }
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
     {
         *pGroupType = lastGroupType;
@@ -3154,6 +3371,15 @@ BOOL TrackPopupMenuHookEx(
     wchar_t wszClassName[200];
     ZeroMemory(wszClassName, 200);
     GetClassNameW(hWnd, wszClassName, 200);
+    EPDebugLogWrite(
+        L"menu popup-ex enter hwnd=%p class=\"%s\" menu=%p flags=0x%x x=%d y=%d",
+        hWnd,
+        wszClassName,
+        hMenu,
+        uFlags,
+        x,
+        y
+    );
 
     BOOL bIsTaskbar = (!wcscmp(wszClassName, L"Shell_TrayWnd") || !wcscmp(wszClassName, L"Shell_SecondaryTrayWnd")) ? !bSkinMenus : bDisableImmersiveContextMenu;
     //wprintf(L">> %s %d %d\n", wszClassName, bIsTaskbar, bIsExplorerProcess);
@@ -3198,6 +3424,7 @@ BOOL TrackPopupMenuHookEx(
                 hWnd,
                 lptpm
             );
+            EPDebugLogWrite(L"menu popup-ex immersive return=%d hwnd=%p class=\"%s\"", bRet, hWnd, wszClassName);
 #if WITH_MAIN_PATCHER
             if (bContainsOwn && (bRet >= 12000 && bRet <= 12200))
             {
@@ -3217,6 +3444,7 @@ BOOL TrackPopupMenuHookEx(
         hWnd,
         lptpm
     );
+    EPDebugLogWrite(L"menu popup-ex return=%d hwnd=%p class=\"%s\"", b, hWnd, wszClassName);
 #if WITH_MAIN_PATCHER
     if (bContainsOwn && (b >= 12000 && b <= 12200))
     {
@@ -3241,6 +3469,15 @@ BOOL TrackPopupMenuHook(
     wchar_t wszClassName[200];
     ZeroMemory(wszClassName, 200);
     GetClassNameW(hWnd, wszClassName, 200);
+    EPDebugLogWrite(
+        L"menu popup enter hwnd=%p class=\"%s\" menu=%p flags=0x%x x=%d y=%d",
+        hWnd,
+        wszClassName,
+        hMenu,
+        uFlags,
+        x,
+        y
+    );
 
     BOOL bIsTaskbar = (!wcscmp(wszClassName, L"Shell_TrayWnd") || !wcscmp(wszClassName, L"Shell_SecondaryTrayWnd")) ? !bSkinMenus : bDisableImmersiveContextMenu;
     //wprintf(L">> %s %d %d\n", wszClassName, bIsTaskbar, bIsExplorerProcess);
@@ -3287,6 +3524,7 @@ BOOL TrackPopupMenuHook(
                 hWnd,
                 prcRect
             );
+            EPDebugLogWrite(L"menu popup immersive return=%d hwnd=%p class=\"%s\"", bRet, hWnd, wszClassName);
 #if WITH_MAIN_PATCHER
             if (bContainsOwn && (bRet >= 12000 && bRet <= 12200))
             {
@@ -3307,6 +3545,7 @@ BOOL TrackPopupMenuHook(
         hWnd,
         prcRect
     );
+    EPDebugLogWrite(L"menu popup return=%d hwnd=%p class=\"%s\"", b, hWnd, wszClassName);
 #if WITH_MAIN_PATCHER
     if (bContainsOwn && (b >= 12000 && b <= 12200))
     {
@@ -10808,6 +11047,12 @@ BOOL CrashCounterHandleEntryPoint()
         BOOL bKeyCombinationTriggered = GetAsyncKeyState(VK_CONTROL) & 0x8000 && GetAsyncKeyState(VK_SHIFT) & 0x8000 && GetAsyncKeyState(VK_MENU) & 0x8000;
         if (cfg.counter >= cfg.threshold || bKeyCombinationTriggered)
         {
+            EPDebugLogWrite(
+                L"crash-counter triggered counter=%lu threshold=%lu keyCombo=%d",
+                cfg.counter,
+                cfg.threshold,
+                bKeyCombinationTriggered
+            );
             cfg.counter = 0;
             RegSetKeyValueW(HKEY_CURRENT_USER, _T(REGPATH), L"CrashCounter", REG_DWORD, &cfg.counter, sizeof(DWORD));
             SHCreateThread(InformUserAboutCrash, NULL, 0, NULL);
@@ -10815,6 +11060,7 @@ BOOL CrashCounterHandleEntryPoint()
         }
         cfg.counter++;
         RegSetKeyValueW(HKEY_CURRENT_USER, _T(REGPATH), L"CrashCounter", REG_DWORD, &cfg.counter, sizeof(DWORD));
+        EPDebugLogWrite(L"crash-counter incremented counter=%lu threshold=%lu", cfg.counter, cfg.threshold);
         SHCreateThread(ClearCrashCounter, cfg.thresholdTime, 0, NULL);
     }
     return FALSE;
@@ -11723,6 +11969,7 @@ DWORD Inject(BOOL bIsExplorer)
     HMODULE hMyTaskbar = PrepareAlternateTaskbarImplementation(&symbols_PTRS, pszTaskbarDll);
     if (hMyTaskbar)
     {
+        EPDebugLogWrite(L"taskbar module loaded module=%p path=\"%s\"", hMyTaskbar, pszTaskbarDll ? pszTaskbarDll : L"");
         VnPatchIAT(hMyTaskbar, "user32.dll", "DeleteMenu", explorer_DeleteMenu);
         VnPatchIAT(hMyTaskbar, "user32.dll", "LoadMenuW", explorer_LoadMenuW);
         VnPatchIAT(hMyTaskbar, "user32.dll", "SendMessageW", explorer_SendMessageW);
@@ -11733,6 +11980,7 @@ DWORD Inject(BOOL bIsExplorer)
         VnPatchIAT(hMyTaskbar, "uxtheme.dll", MAKEINTRESOURCEA(126), PeopleBand_DrawTextWithGlowHook);
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
+        EPDebugLogWrite(L"taskbar vtable hooks installed pinnedQuickLaunch=%lu removeGap=%lu", bPinnedItemsActAsQuickLaunch, bRemoveExtraGapAroundPinnedItems);
     }
 
     CreateThread(NULL, 0, LauncherGroupsThread, 0, 0, NULL);
@@ -13671,6 +13919,11 @@ HRESULT EntryPoint(DWORD dwMethod)
     }
 
     bIsExplorerProcess = bIsThisExplorer;
+    if (bIsThisExplorer)
+    {
+        EPDebugInstallExceptionLogging();
+        EPDebugLogWrite(L"entry explorer method=%lu desktopCheckPending=1 dll=\"%s\"", dwMethod, dllName);
+    }
     if (bIsThisExplorer)
     {
 #if WITH_MAIN_PATCHER

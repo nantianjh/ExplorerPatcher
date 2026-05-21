@@ -907,6 +907,7 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_RENAME 2101
 #define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
 #define EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY 2103
+#define EP_LAUNCHER_GROUP_MENU_DISSOLVE 2104
 #define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
 
 typedef struct _LauncherGroupItem
@@ -933,6 +934,8 @@ typedef struct _LauncherGroup
 
 LauncherGroup* g_launcherGroups = NULL;
 DWORD g_launcherGroupsThreadId = 0;
+HWND g_launcherGroupsLastForegroundWindow = NULL;
+HWINEVENTHOOK g_launcherGroupsForegroundHook = NULL;
 
 void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
 {
@@ -1246,6 +1249,69 @@ void LauncherGroups_PostReload()
     }
 }
 
+BOOL LauncherGroups_IsLauncherGroupWindow(HWND hWnd)
+{
+    WCHAR className[128];
+    className[0] = L'\0';
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+    return !_wcsicmp(className, EP_LAUNCHER_GROUP_CLASS_NAME);
+}
+
+BOOL LauncherGroups_IsTaskbarOrShellWindow(HWND hWnd)
+{
+    WCHAR className[128];
+    className[0] = L'\0';
+    GetClassNameW(hWnd, className, ARRAYSIZE(className));
+    return !wcscmp(className, L"Shell_TrayWnd")
+        || !wcscmp(className, L"Shell_SecondaryTrayWnd")
+        || !wcscmp(className, L"MSTaskListWClass")
+        || !wcscmp(className, L"TrayNotifyWnd")
+        || !wcscmp(className, L"CabinetWClass")
+        || !wcscmp(className, L"Progman")
+        || !wcscmp(className, L"WorkerW");
+}
+
+BOOL LauncherGroups_IsUsableSourceWindow(HWND hWnd)
+{
+    if (!hWnd || !IsWindow(hWnd) || !IsWindowVisible(hWnd))
+    {
+        return FALSE;
+    }
+
+    hWnd = GetAncestor(hWnd, GA_ROOT);
+    if (!hWnd || LauncherGroups_IsLauncherGroupWindow(hWnd) || LauncherGroups_IsTaskbarOrShellWindow(hWnd))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+void LauncherGroups_UpdateLastForegroundWindow(HWND hWnd)
+{
+    hWnd = GetAncestor(hWnd, GA_ROOT);
+    if (LauncherGroups_IsUsableSourceWindow(hWnd))
+    {
+        g_launcherGroupsLastForegroundWindow = hWnd;
+        EPDebugLogWrite(L"launcher-group foreground hwnd=%p", hWnd);
+    }
+}
+
+void CALLBACK LauncherGroups_ForegroundWinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hWnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD idEventThread,
+    DWORD dwmsEventTime)
+{
+    if (event == EVENT_SYSTEM_FOREGROUND && idObject == OBJID_WINDOW && idChild == CHILDID_SELF)
+    {
+        LauncherGroups_UpdateLastForegroundWindow(hWnd);
+    }
+}
+
 BOOL LauncherGroups_CreateRegistryGroup(LPCWSTR name)
 {
     HKEY hRoot = NULL;
@@ -1292,9 +1358,9 @@ BOOL LauncherGroups_CreateRegistryGroupPrompt(HWND hWnd)
     WCHAR name[128];
     BOOL cancelled = FALSE;
 
-    swprintf_s(defaultName, ARRAYSIZE(defaultName), L"分组%lu", GetTickCount() % 10000);
+    swprintf_s(defaultName, ARRAYSIZE(defaultName), L"\u5206\u7EC4%lu", GetTickCount() % 10000);
     LauncherGroups_CopyString(name, ARRAYSIZE(name), defaultName);
-    if (FAILED(InputBox(FALSE, hWnd, L"输入分组名称", L"新建图标分组", defaultName, name, ARRAYSIZE(name), &cancelled)) || cancelled || !name[0])
+    if (FAILED(InputBox(FALSE, hWnd, L"\u8F93\u5165\u5206\u7EC4\u540D\u79F0", L"\u65B0\u5EFA\u56FE\u6807\u5206\u7EC4", defaultName, name, ARRAYSIZE(name), &cancelled)) || cancelled || !name[0])
     {
         return FALSE;
     }
@@ -1317,7 +1383,7 @@ BOOL LauncherGroups_RenameRegistryGroup(LauncherGroup* group)
 
     LauncherGroups_CopyString(newName, ARRAYSIZE(newName), group->szName);
     LauncherGroups_CopyString(oldName, ARRAYSIZE(oldName), group->szName);
-    if (FAILED(InputBox(FALSE, group->hWnd, L"输入分组名称", L"修改分组名", group->szName, newName, ARRAYSIZE(newName), &cancelled)) || cancelled || !newName[0])
+    if (FAILED(InputBox(FALSE, group->hWnd, L"\u8F93\u5165\u5206\u7EC4\u540D\u79F0", L"\u4FEE\u6539\u5206\u7EC4\u540D", group->szName, newName, ARRAYSIZE(newName), &cancelled)) || cancelled || !newName[0])
     {
         return FALSE;
     }
@@ -1346,6 +1412,83 @@ BOOL LauncherGroups_RenameRegistryGroup(LauncherGroup* group)
     return ok;
 }
 
+void LauncherGroups_FreeGroup(LauncherGroup* group)
+{
+    if (!group)
+    {
+        return;
+    }
+
+    if (group->hIconSmall)
+    {
+        DestroyIcon(group->hIconSmall);
+    }
+    if (group->hIconLarge)
+    {
+        DestroyIcon(group->hIconLarge);
+    }
+    for (DWORD i = 0; i < group->cItems; i++)
+    {
+        if (group->items[i].hIconSmall)
+        {
+            DestroyIcon(group->items[i].hIconSmall);
+        }
+        if (group->items[i].hIconLarge)
+        {
+            DestroyIcon(group->items[i].hIconLarge);
+        }
+    }
+    free(group);
+}
+
+BOOL LauncherGroups_DissolveGroup(LauncherGroup* group)
+{
+    WCHAR regPath[256];
+    WCHAR groupName[128];
+    BOOL ok;
+
+    if (!group)
+    {
+        return FALSE;
+    }
+
+    if (MessageBoxW(
+        group->hWnd,
+        L"\u786E\u5B9A\u8981\u89E3\u6563\u6B64\u5206\u7EC4\u5417\uFF1F",
+        L"\u89E3\u6563\u5206\u7EC4",
+        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+    {
+        return FALSE;
+    }
+
+    LauncherGroups_CopyString(groupName, ARRAYSIZE(groupName), group->szName);
+    swprintf_s(regPath, ARRAYSIZE(regPath), L"%s\\%s", EP_LAUNCHER_GROUPS_REGPATH, group->szKeyName);
+    ok = RegDeleteTreeW(HKEY_CURRENT_USER, regPath) == ERROR_SUCCESS;
+    if (!ok)
+    {
+        EPDebugLogWrite(L"launcher-group dissolve registry failed group=\"%s\" key=\"%s\"", group->szName, group->szKeyName);
+        return FALSE;
+    }
+
+    LauncherGroup** current = &g_launcherGroups;
+    while (*current && *current != group)
+    {
+        current = &(*current)->next;
+    }
+    if (*current == group)
+    {
+        *current = group->next;
+    }
+
+    if (group->hWnd)
+    {
+        DestroyWindow(group->hWnd);
+    }
+    LauncherGroups_FreeGroup(group);
+    EPDebugLogWrite(L"launcher-group dissolved group=\"%s\"", groupName);
+    return TRUE;
+}
+
 BOOL LauncherGroups_AddWindowToGroup(LauncherGroup* group, HWND hSourceWnd)
 {
     DWORD processId = 0;
@@ -1362,11 +1505,18 @@ BOOL LauncherGroups_AddWindowToGroup(LauncherGroup* group, HWND hSourceWnd)
         return FALSE;
     }
 
-    if (!hSourceWnd || hSourceWnd == group->hWnd)
+    if (!LauncherGroups_IsUsableSourceWindow(hSourceWnd))
     {
-        hSourceWnd = GetLastActivePopup(GetShellWindow());
+        hSourceWnd = g_launcherGroupsLastForegroundWindow;
+    }
+    if (!LauncherGroups_IsUsableSourceWindow(hSourceWnd))
+    {
+        EPDebugLogWrite(L"launcher-group add-window no usable source group=\"%s\" source=%p last=%p", group->szName, hSourceWnd, g_launcherGroupsLastForegroundWindow);
+        MessageBoxW(group->hWnd, L"\u8BF7\u5148\u6FC0\u6D3B\u8981\u52A0\u5165\u5206\u7EC4\u7684\u8F6F\u4EF6\u7A97\u53E3\uFF0C\u7136\u540E\u518D\u70B9\u51FB\u6B64\u9879\u3002", L"\u6DFB\u52A0\u5F53\u524D\u7A97\u53E3", MB_ICONINFORMATION);
+        return FALSE;
     }
 
+    hSourceWnd = GetAncestor(hSourceWnd, GA_ROOT);
     GetWindowThreadProcessId(hSourceWnd, &processId);
     hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (!hProcess)
@@ -1454,9 +1604,10 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
     {
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
-    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"添加当前窗口");
-    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_RENAME, L"修改分组名");
-    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY, L"打开分组配置");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"\u6DFB\u52A0\u5F53\u524D\u7A97\u53E3");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_RENAME, L"\u4FEE\u6539\u5206\u7EC4\u540D");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_DISSOLVE, L"\u89E3\u6563\u5206\u7EC4");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY, L"\u6253\u5F00\u5206\u7EC4\u914D\u7F6E");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_GRAYED, 0, EP_LAUNCHER_GROUPS_REGPATH);
 
@@ -1471,6 +1622,7 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
         LauncherGroupItem* item = &group->items[cmd - EP_LAUNCHER_GROUP_MENU_BASE];
         EPDebugLogWrite(L"launcher-group launch group=\"%s\" item=\"%s\" path=\"%s\"", group->szName, item->szName, item->szPath);
         ShellExecuteW(NULL, L"open", item->szPath, item->szArgs[0] ? item->szArgs : NULL, NULL, SW_SHOWNORMAL);
+        LauncherGroups_UpdateLastForegroundWindow(GetForegroundWindow());
     }
     else if (cmd == EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND)
     {
@@ -1479,6 +1631,11 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
     else if (cmd == EP_LAUNCHER_GROUP_MENU_RENAME)
     {
         LauncherGroups_RenameRegistryGroup(group);
+    }
+    else if (cmd == EP_LAUNCHER_GROUP_MENU_DISSOLVE)
+    {
+        LauncherGroups_DissolveGroup(group);
+        return;
     }
     else if (cmd == EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY)
     {
@@ -1586,6 +1743,15 @@ DWORD LauncherGroupsThread(DWORD unused)
     wc.lpszClassName = EP_LAUNCHER_GROUP_CLASS_NAME;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     RegisterClassW(&wc);
+    g_launcherGroupsForegroundHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_FOREGROUND,
+        NULL,
+        LauncherGroups_ForegroundWinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT);
+    LauncherGroups_UpdateLastForegroundWindow(GetForegroundWindow());
 
     LauncherGroups_CreateWindowsForLoadedGroups();
 
@@ -1603,6 +1769,11 @@ DWORD LauncherGroupsThread(DWORD unused)
         DispatchMessageW(&msg);
     }
 
+    if (g_launcherGroupsForegroundHook)
+    {
+        UnhookWinEvent(g_launcherGroupsForegroundHook);
+        g_launcherGroupsForegroundHook = NULL;
+    }
     return 0;
 }
 #endif
@@ -3458,7 +3629,7 @@ void LauncherGroups_AddTaskbarMenuItem(HMENU hMenu)
     menuInfo.cbSize = sizeof(menuInfo);
     menuInfo.fMask = MIIM_ID | MIIM_STRING | MIIM_STATE;
     menuInfo.wID = EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE;
-    menuInfo.dwTypeData = L"新建图标分组";
+    menuInfo.dwTypeData = L"\u65B0\u5EFA\u56FE\u6807\u5206\u7EC4";
     menuInfo.cch = (UINT)wcslen(menuInfo.dwTypeData);
     menuInfo.fState = MFS_ENABLED;
 

@@ -14,6 +14,8 @@
 #include <Uxtheme.h>
 #pragma comment(lib, "UxTheme.lib")
 #include <Shlobj_core.h>
+#include <OleIdl.h>
+#pragma comment(lib, "Ole32.lib")
 #include <propvarutil.h>
 #pragma comment(lib, "Propsys.lib")
 #include <commctrl.h>
@@ -941,7 +943,6 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_REMOVE_LAST (EP_LAUNCHER_GROUP_MENU_REMOVE_FIRST + EP_LAUNCHER_GROUP_MAX_ITEMS - 1)
 #define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
 #define EP_LAUNCHER_GROUP_HOVER_TIMER 6151
-#define EP_LAUNCHER_GROUP_CLICK_TIMER 6152
 #define EP_LAUNCHER_GROUP_MENU_MODE_NONE 0
 #define EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS 1
 #define EP_LAUNCHER_GROUP_VIEWMODE_VALUE L"LauncherGroupsViewMode"
@@ -985,7 +986,8 @@ typedef struct _LauncherGroup
     BOOL bSuppressNextClick;
     DWORD dwSuppressClickUntil;
     int iDragItem;
-    int iPendingClickItem;
+    IDropTarget* pDropTarget;
+    IDropTarget* pListDropTarget;
     DWORD dwMenuMode;
     struct _LauncherGroup* next;
 } LauncherGroup;
@@ -995,6 +997,13 @@ typedef struct _LauncherGroupsActivateExistingWindowContext
     LauncherGroupItem* item;
     HWND hMatchedWnd;
 } LauncherGroupsActivateExistingWindowContext;
+
+typedef struct _LauncherGroupsDropTarget
+{
+    IDropTarget iface;
+    LONG refCount;
+    LauncherGroup* group;
+} LauncherGroupsDropTarget;
 
 LauncherGroup* g_launcherGroups = NULL;
 DWORD g_launcherGroupsThreadId = 0;
@@ -1009,6 +1018,8 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
 SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group);
 void LauncherGroups_ResizeAppsListView(LauncherGroup* group);
+void LauncherGroups_RegisterDropTargets(LauncherGroup* group);
+void LauncherGroups_RevokeDropTargets(LauncherGroup* group);
 
 void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
 {
@@ -1308,6 +1319,25 @@ void LauncherGroups_RefreshGroupAfterItemsChanged(LauncherGroup* group)
         }
     }
 }
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_QueryInterface(IDropTarget* This, REFIID riid, void** ppvObject);
+ULONG STDMETHODCALLTYPE LauncherGroups_DropTarget_AddRef(IDropTarget* This);
+ULONG STDMETHODCALLTYPE LauncherGroups_DropTarget_Release(IDropTarget* This);
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragEnter(IDropTarget* This, IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect);
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragOver(IDropTarget* This, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect);
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragLeave(IDropTarget* This);
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_Drop(IDropTarget* This, IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect);
+
+IDropTargetVtbl g_LauncherGroupsDropTargetVtbl =
+{
+    LauncherGroups_DropTarget_QueryInterface,
+    LauncherGroups_DropTarget_AddRef,
+    LauncherGroups_DropTarget_Release,
+    LauncherGroups_DropTarget_DragEnter,
+    LauncherGroups_DropTarget_DragOver,
+    LauncherGroups_DropTarget_DragLeave,
+    LauncherGroups_DropTarget_Drop
+};
 
 BOOL CALLBACK LauncherGroups_HideSystemPreviewEnumProc(HWND hWnd, LPARAM lParam)
 {
@@ -2045,6 +2075,7 @@ BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
     SendMessageW(group->hListView, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     ListView_SetExtendedListViewStyle(group->hListView, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP);
     DragAcceptFiles(group->hListView, TRUE);
+    LauncherGroups_RegisterDropTargets(group);
     return TRUE;
 }
 
@@ -2846,7 +2877,7 @@ BOOL LauncherGroups_AddPathToGroup(LauncherGroup* group, LPCWSTR path)
     return ok;
 }
 
-void LauncherGroups_AddDroppedFiles(LauncherGroup* group, HDROP hDrop)
+void LauncherGroups_AddDroppedFiles(LauncherGroup* group, HDROP hDrop, BOOL bFinishDrop)
 {
     UINT count;
 
@@ -2865,7 +2896,196 @@ void LauncherGroups_AddDroppedFiles(LauncherGroup* group, HDROP hDrop)
             LauncherGroups_AddPathToGroup(group, path);
         }
     }
-    DragFinish(hDrop);
+    if (bFinishDrop)
+    {
+        DragFinish(hDrop);
+    }
+}
+
+HRESULT LauncherGroups_AddDataObjectToGroup(LauncherGroup* group, IDataObject* pDataObj)
+{
+    FORMATETC fmt;
+    STGMEDIUM medium;
+
+    if (!group || !pDataObj)
+    {
+        return E_INVALIDARG;
+    }
+
+    ZeroMemory(&fmt, sizeof(fmt));
+    fmt.cfFormat = CF_HDROP;
+    fmt.dwAspect = DVASPECT_CONTENT;
+    fmt.lindex = -1;
+    fmt.tymed = TYMED_HGLOBAL;
+    ZeroMemory(&medium, sizeof(medium));
+
+    if (FAILED(pDataObj->lpVtbl->GetData(pDataObj, &fmt, &medium)))
+    {
+        return DV_E_FORMATETC;
+    }
+
+    LauncherGroups_AddDroppedFiles(group, (HDROP)medium.hGlobal, FALSE);
+    ReleaseStgMedium(&medium);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_QueryInterface(IDropTarget* This, REFIID riid, void** ppvObject)
+{
+    if (!ppvObject)
+    {
+        return E_POINTER;
+    }
+
+    *ppvObject = NULL;
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropTarget))
+    {
+        *ppvObject = This;
+        LauncherGroups_DropTarget_AddRef(This);
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE LauncherGroups_DropTarget_AddRef(IDropTarget* This)
+{
+    LauncherGroupsDropTarget* target = (LauncherGroupsDropTarget*)This;
+    return InterlockedIncrement(&target->refCount);
+}
+
+ULONG STDMETHODCALLTYPE LauncherGroups_DropTarget_Release(IDropTarget* This)
+{
+    LauncherGroupsDropTarget* target = (LauncherGroupsDropTarget*)This;
+    LONG refCount = InterlockedDecrement(&target->refCount);
+    if (!refCount)
+    {
+        free(target);
+    }
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragEnter(IDropTarget* This, IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)
+{
+    UNREFERENCED_PARAMETER(This);
+    UNREFERENCED_PARAMETER(pDataObj);
+    UNREFERENCED_PARAMETER(grfKeyState);
+    UNREFERENCED_PARAMETER(pt);
+    if (pdwEffect)
+    {
+        *pdwEffect = DROPEFFECT_COPY;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragOver(IDropTarget* This, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)
+{
+    UNREFERENCED_PARAMETER(This);
+    UNREFERENCED_PARAMETER(grfKeyState);
+    UNREFERENCED_PARAMETER(pt);
+    if (pdwEffect)
+    {
+        *pdwEffect = DROPEFFECT_COPY;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_DragLeave(IDropTarget* This)
+{
+    UNREFERENCED_PARAMETER(This);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE LauncherGroups_DropTarget_Drop(IDropTarget* This, IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)
+{
+    LauncherGroupsDropTarget* target = (LauncherGroupsDropTarget*)This;
+    HRESULT hr;
+
+    UNREFERENCED_PARAMETER(grfKeyState);
+    UNREFERENCED_PARAMETER(pt);
+    hr = LauncherGroups_AddDataObjectToGroup(target ? target->group : NULL, pDataObj);
+    if (pdwEffect)
+    {
+        *pdwEffect = SUCCEEDED(hr) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    }
+    return hr;
+}
+
+IDropTarget* LauncherGroups_CreateDropTarget(LauncherGroup* group)
+{
+    LauncherGroupsDropTarget* target;
+
+    if (!group)
+    {
+        return NULL;
+    }
+
+    target = calloc(1, sizeof(*target));
+    if (!target)
+    {
+        return NULL;
+    }
+    target->iface.lpVtbl = &g_LauncherGroupsDropTargetVtbl;
+    target->refCount = 1;
+    target->group = group;
+    return &target->iface;
+}
+
+void LauncherGroups_RegisterDropTargetForWindow(HWND hWnd, LauncherGroup* group, IDropTarget** ppDropTarget)
+{
+    IDropTarget* pDropTarget;
+
+    if (!hWnd || !IsWindow(hWnd) || !group || !ppDropTarget || *ppDropTarget)
+    {
+        return;
+    }
+
+    pDropTarget = LauncherGroups_CreateDropTarget(group);
+    if (!pDropTarget)
+    {
+        return;
+    }
+
+    if (SUCCEEDED(RegisterDragDrop(hWnd, pDropTarget)))
+    {
+        *ppDropTarget = pDropTarget;
+    }
+    else
+    {
+        pDropTarget->lpVtbl->Release(pDropTarget);
+    }
+}
+
+void LauncherGroups_RegisterDropTargets(LauncherGroup* group)
+{
+    if (!group)
+    {
+        return;
+    }
+
+    LauncherGroups_RegisterDropTargetForWindow(group->hWnd, group, &group->pDropTarget);
+    LauncherGroups_RegisterDropTargetForWindow(group->hListView, group, &group->pListDropTarget);
+}
+
+void LauncherGroups_RevokeDropTargetForWindow(HWND hWnd, IDropTarget** ppDropTarget)
+{
+    if (!hWnd || !ppDropTarget || !*ppDropTarget)
+    {
+        return;
+    }
+
+    RevokeDragDrop(hWnd);
+    (*ppDropTarget)->lpVtbl->Release(*ppDropTarget);
+    *ppDropTarget = NULL;
+}
+
+void LauncherGroups_RevokeDropTargets(LauncherGroup* group)
+{
+    if (!group)
+    {
+        return;
+    }
+
+    LauncherGroups_RevokeDropTargetForWindow(group->hListView, &group->pListDropTarget);
+    LauncherGroups_RevokeDropTargetForWindow(group->hWnd, &group->pDropTarget);
 }
 
 BOOL LauncherGroups_GetProcessPath(HWND hWnd, WCHAR* path, DWORD cchPath)
@@ -2900,7 +3120,7 @@ BOOL CALLBACK LauncherGroups_ActivateExistingWindowEnumProc(HWND hWnd, LPARAM lP
     WCHAR path[MAX_PATH];
     WINDOWPLACEMENT placement;
 
-    if (!item || !LauncherGroups_IsUsableSourceWindow(hWnd) || !LauncherGroups_GetProcessPath(hWnd, path, ARRAYSIZE(path)))
+    if (!item || !hWnd || !IsWindow(hWnd) || LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT)) || LauncherGroups_IsTaskbarOrShellWindow(GetAncestor(hWnd, GA_ROOT)) || !LauncherGroups_GetProcessPath(hWnd, path, ARRAYSIZE(path)))
     {
         return TRUE;
     }
@@ -2915,6 +3135,10 @@ BOOL CALLBACK LauncherGroups_ActivateExistingWindowEnumProc(HWND hWnd, LPARAM lP
     if (GetWindowPlacement(hWnd, &placement) && placement.showCmd == SW_SHOWMINIMIZED)
     {
         ShowWindowAsync(hWnd, SW_RESTORE);
+    }
+    else if (!IsWindowVisible(hWnd))
+    {
+        ShowWindowAsync(hWnd, SW_SHOWNORMAL);
     }
     SetForegroundWindow(hWnd);
     return FALSE;
@@ -3090,28 +3314,6 @@ void LauncherGroups_LaunchListViewItem(LauncherGroup* group, int itemIndex, BOOL
     LauncherGroups_HideAppsWindow(group);
 }
 
-void LauncherGroups_QueueSingleClickLaunch(LauncherGroup* group, int itemIndex)
-{
-    if (!group || !group->hWnd || itemIndex < 0 || itemIndex >= (int)group->cItems)
-    {
-        return;
-    }
-
-    group->iPendingClickItem = itemIndex;
-    SetTimer(group->hWnd, EP_LAUNCHER_GROUP_CLICK_TIMER, GetDoubleClickTime() + 20, NULL);
-}
-
-void LauncherGroups_CancelQueuedSingleClick(LauncherGroup* group)
-{
-    if (!group || !group->hWnd)
-    {
-        return;
-    }
-
-    KillTimer(group->hWnd, EP_LAUNCHER_GROUP_CLICK_TIMER);
-    group->iPendingClickItem = -1;
-}
-
 int LauncherGroups_HitTestListViewItem(LauncherGroup* group)
 {
     DWORD messagePos;
@@ -3165,9 +3367,9 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         if (group)
         {
             group->hWnd = hWnd;
-            group->iPendingClickItem = -1;
             DragAcceptFiles(hWnd, TRUE);
             LauncherGroups_UpdateAppsWindow(group);
+            LauncherGroups_RegisterDropTargets(group);
         }
         EPDebugLogWrite(L"launcher-group create hwnd=%p group=\"%s\"", hWnd, group ? group->szName : L"");
         return 0;
@@ -3228,19 +3430,6 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             }
             return 0;
         }
-        if (wParam == EP_LAUNCHER_GROUP_CLICK_TIMER)
-        {
-            int itemIndex;
-            if (!group)
-            {
-                KillTimer(hWnd, EP_LAUNCHER_GROUP_CLICK_TIMER);
-                return 0;
-            }
-            itemIndex = group->iPendingClickItem;
-            LauncherGroups_CancelQueuedSingleClick(group);
-            LauncherGroups_LaunchListViewItem(group, itemIndex, FALSE);
-            return 0;
-        }
         break;
     case WM_SYSCOMMAND:
         if ((wParam & 0xFFF0) == SC_RESTORE || (wParam & 0xFFF0) == SC_MAXIMIZE)
@@ -3279,27 +3468,30 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                     }
                 }
                 itemIndex = LauncherGroups_HitTestListViewItem(group);
-                LauncherGroups_QueueSingleClickLaunch(group, itemIndex);
+                LauncherGroups_LaunchListViewItem(group, itemIndex, FALSE);
                 return 0;
             }
-            if (hdr->code == NM_DBLCLK)
+            if (hdr->code == NM_DBLCLK || hdr->code == LVN_ITEMACTIVATE)
+            {
+                return 0;
+            }
+            if (hdr->code == NM_RCLICK)
             {
                 int itemIndex = LauncherGroups_HitTestListViewItem(group);
-                if (group->bSuppressNextClick)
+
+                if (group->bDragActive)
                 {
-                    BOOL suppress = GetTickCount() < group->dwSuppressClickUntil;
-                    group->bSuppressNextClick = FALSE;
-                    if (suppress)
-                    {
-                        return 0;
-                    }
+                    return 0;
                 }
-                LauncherGroups_CancelQueuedSingleClick(group);
-                LauncherGroups_LaunchListViewItem(group, itemIndex, TRUE);
-                return 0;
-            }
-            if (hdr->code == LVN_ITEMACTIVATE)
-            {
+
+                if (itemIndex >= 0 && itemIndex < (int)group->cItems)
+                {
+                    LauncherGroups_LaunchListViewItem(group, itemIndex, TRUE);
+                }
+                else
+                {
+                    PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+                }
                 return 0;
             }
             if (hdr->code == LVN_BEGINDRAG)
@@ -3314,15 +3506,6 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                     SetCapture(hWnd);
                     EPDebugLogWrite(L"launcher-group drag begin group=\"%s\" index=%d", group->szName, group->iDragItem);
                 }
-                return 0;
-            }
-            if (hdr->code == NM_RCLICK)
-            {
-                if (group->bDragActive)
-                {
-                    return 0;
-                }
-                PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
                 return 0;
             }
             if (hdr->code == LVN_KEYDOWN)
@@ -3382,7 +3565,7 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         }
         break;
     case WM_DROPFILES:
-        LauncherGroups_AddDroppedFiles(group, (HDROP)wParam);
+        LauncherGroups_AddDroppedFiles(group, (HDROP)wParam, TRUE);
         return 0;
     case WM_CONTEXTMENU:
         PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
@@ -3393,7 +3576,7 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     case WM_DESTROY:
         if (group)
         {
-            LauncherGroups_CancelQueuedSingleClick(group);
+            LauncherGroups_RevokeDropTargets(group);
             DragAcceptFiles(hWnd, FALSE);
             if (group->hListView && IsWindow(group->hListView))
             {
@@ -3450,6 +3633,11 @@ DWORD LauncherGroupsThread(DWORD unused)
     WNDCLASSW wc;
     INITCOMMONCONTROLSEX icc;
     MSG dummyMsg;
+    HRESULT hrOle;
+    BOOL bOleInitialized;
+
+    hrOle = OleInitialize(NULL);
+    bOleInitialized = SUCCEEDED(hrOle);
     PeekMessageW(&dummyMsg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
     g_launcherGroupsThreadId = GetCurrentThreadId();
     g_launcherGroupsViewMode = LauncherGroups_ReadViewModeFromRegistry();
@@ -3511,6 +3699,10 @@ DWORD LauncherGroupsThread(DWORD unused)
     {
         UnhookWinEvent(g_launcherGroupsForegroundHook);
         g_launcherGroupsForegroundHook = NULL;
+    }
+    if (bOleInitialized)
+    {
+        OleUninitialize();
     }
     return 0;
 }
@@ -3925,6 +4117,19 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList()
     return FALSE;
 }
 
+BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
+{
+    if (groupType == TBG_LAUNCHER || groupType == TBG_GHOST)
+    {
+        return FALSE;
+    }
+    if (rowColBegin != 0 || rowColEnd <= rowColBegin)
+    {
+        return FALSE;
+    }
+    return Win10TaskbarHooks_HasMultiRowTaskList();
+}
+
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
 int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
@@ -3944,6 +4149,26 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
+    if (Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(lastGroupType, rowColBegin, rowColEnd))
+    {
+        if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
+        {
+            *pGroupType = lastGroupType;
+            bTypeModified = FALSE;
+        }
+        if (pcxShrinkable)
+        {
+            *pcxShrinkable = 0;
+        }
+        EPDebugLogWrite(
+            L"taskbtn first-row blocked type=%d begin=%d end=%d originalSpan=%d",
+            lastGroupType,
+            rowColBegin,
+            rowColEnd,
+            ret
+        );
+        ret = 0;
+    }
     static LONG spanLogCount = 0;
     LONG currentSpanLogCount = InterlockedIncrement(&spanLogCount);
     if (currentSpanLogCount <= 1000)
@@ -3985,7 +4210,7 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (bRemoveExtraGapAroundPinnedItems)
+    if (pVtbl)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))

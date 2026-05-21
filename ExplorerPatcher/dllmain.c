@@ -18,6 +18,8 @@
 #include <Shlobj_core.h>
 #include <OleIdl.h>
 #pragma comment(lib, "Ole32.lib")
+#include <Propsys.h>
+#include <propkey.h>
 #include <propvarutil.h>
 #pragma comment(lib, "Propsys.lib")
 #include <commctrl.h>
@@ -1022,6 +1024,7 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group);
 void LauncherGroups_ResizeAppsListView(LauncherGroup* group);
 void LauncherGroups_RegisterDropTargets(LauncherGroup* group);
 void LauncherGroups_RevokeDropTargets(LauncherGroup* group);
+void LauncherGroups_SetAppUserModelId(LauncherGroup* group);
 
 void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
 {
@@ -2455,6 +2458,38 @@ BOOL LauncherGroups_IsLauncherGroupWindow(HWND hWnd)
     return !_wcsicmp(className, EP_LAUNCHER_GROUP_CLASS_NAME);
 }
 
+void LauncherGroups_SetAppUserModelId(LauncherGroup* group)
+{
+    IPropertyStore* pPropertyStore = NULL;
+    PROPVARIANT prop;
+    WCHAR appId[256];
+    ULONGLONG hash = 1469598103934665603ULL;
+
+    if (!group || !group->hWnd || !group->szKeyName[0])
+    {
+        return;
+    }
+
+    for (const WCHAR* p = group->szKeyName; *p; p++)
+    {
+        hash ^= (ULONGLONG)*p;
+        hash *= 1099511628211ULL;
+    }
+    swprintf_s(appId, ARRAYSIZE(appId), L"ExplorerPatcher.LauncherGroup.%016I64X", hash);
+    PropVariantInit(&prop);
+    if (SUCCEEDED(InitPropVariantFromString(appId, &prop)))
+    {
+        if (SUCCEEDED(SHGetPropertyStoreForWindow(group->hWnd, &IID_IPropertyStore, (void**)&pPropertyStore)))
+        {
+            pPropertyStore->lpVtbl->SetValue(pPropertyStore, &PKEY_AppUserModel_ID, &prop);
+            pPropertyStore->lpVtbl->Commit(pPropertyStore);
+            pPropertyStore->lpVtbl->Release(pPropertyStore);
+            EPDebugLogWrite(L"launcher-group appid hwnd=%p group=\"%s\" appid=\"%s\"", group->hWnd, group->szName, appId);
+        }
+        PropVariantClear(&prop);
+    }
+}
+
 BOOL LauncherGroups_IsTaskbarOrShellWindow(HWND hWnd)
 {
     WCHAR className[128];
@@ -3410,6 +3445,7 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
         if (group)
         {
             group->hWnd = hWnd;
+            LauncherGroups_SetAppUserModelId(group);
             DragAcceptFiles(hWnd, TRUE);
             LauncherGroups_UpdateAppsWindow(group);
             LauncherGroups_RegisterDropTargets(group);
@@ -3646,7 +3682,7 @@ void LauncherGroups_CreateWindowsForLoadedGroups()
         }
 
         group->hWnd = CreateWindowExW(
-            WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             EP_LAUNCHER_GROUP_CLASS_NAME,
             group->szName,
             WS_OVERLAPPEDWINDOW,
@@ -3662,9 +3698,16 @@ void LauncherGroups_CreateWindowsForLoadedGroups()
         if (group->hWnd)
         {
             LauncherGroups_DisableSystemPreview(group->hWnd);
+            LauncherGroups_SetAppUserModelId(group);
             SendMessageW(group->hWnd, WM_SETICON, ICON_SMALL, (LPARAM)group->hIconSmall);
             SendMessageW(group->hWnd, WM_SETICON, ICON_BIG, (LPARAM)group->hIconLarge);
             LauncherGroups_UpdateWindowSize(group);
+            SetWindowLongPtrW(
+                group->hWnd,
+                GWL_EXSTYLE,
+                (GetWindowLongPtrW(group->hWnd, GWL_EXSTYLE) & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW | WS_EX_NOACTIVATE
+            );
+            SetWindowPos(group->hWnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
             ShowWindow(group->hWnd, SW_SHOWNOACTIVATE);
             EPDebugLogWrite(L"launcher-group window shown hwnd=%p group=\"%s\"", group->hWnd, group->szName);
         }
@@ -3917,7 +3960,39 @@ void ReportSuccessfulAnimationPatching()
 DEFINE_GUID(IID_ITaskGroup,
     0x3af85589, 0x678f, 0x4fb5, 0x89, 0x25, 0x5a, 0x13, 0x4e, 0xbf, 0x57, 0x2c);
 
+typedef interface ITaskItem ITaskItem;
 typedef interface ITaskGroup ITaskGroup;
+
+typedef struct ITaskItemVtbl
+{
+    BEGIN_INTERFACE
+
+    void* QueryInterface;
+    void* AddRef;
+    ULONG(STDMETHODCALLTYPE* Release)(
+        ITaskItem* This);
+    void* GetFlags;
+    void* GetLastActivatedTime;
+    void* UpdateLastActivatedTime;
+    void* GetLastInteractiveStartTime;
+    void* SetLastInteractiveStartTime;
+    void* HasBeenInteracted;
+    void* GetIconId;
+    void* SetIconId;
+    HRESULT(STDMETHODCALLTYPE* SetWindow)(
+        ITaskItem* This,
+        HWND hWnd);
+    HWND(STDMETHODCALLTYPE* GetWindow)(
+        ITaskItem* This);
+    // ...
+
+    END_INTERFACE
+} ITaskItemVtbl;
+
+interface ITaskItem
+{
+    CONST_VTBL struct ITaskItemVtbl* lpVtbl;
+};
 
 typedef struct ITaskGroupVtbl
 {
@@ -3953,7 +4028,7 @@ typedef struct ITaskGroupVtbl
         ITEMIDLIST* pCompareItemIdList,
         WCHAR* pCompareAppId,
         int* pnMatch,
-        LONG** p_task_item);
+        ITaskItem** p_task_item);
     // ...
 
     END_INTERFACE
@@ -3974,9 +4049,9 @@ typedef enum tagWINDOWMATCHCONFIDENCE
 } WINDOWMATCHCONFIDENCE;
 
 HRESULT(STDMETHODCALLTYPE *CTaskGroup_DoesWindowMatchFunc)(ITaskGroup* pTaskGroup, HWND hCompareWnd, ITEMIDLIST* pCompareItemIdList,
-    WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, LONG_PTR** p_task_item) = NULL;
+    WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, ITaskItem** p_task_item) = NULL;
 HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup, HWND hCompareWnd, ITEMIDLIST* pCompareItemIdList,
-    WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, LONG_PTR** p_task_item)
+    WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, ITaskItem** p_task_item)
 {
     HRESULT hr = CTaskGroup_DoesWindowMatchFunc(pTaskGroup, hCompareWnd, pCompareItemIdList, pCompareAppId, pnMatch, p_task_item);
     if (bPinnedItemsActAsQuickLaunch && SUCCEEDED(hr) && pnMatch
@@ -3987,6 +4062,17 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
         HDPA hdpaItems = *(HDPA*)(_this + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
         int itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
         BOOL bPinned = itemCount == 0;
+        if (LauncherGroups_IsLauncherGroupWindow(GetAncestor(hCompareWnd, GA_ROOT)))
+        {
+            if (p_task_item)
+            {
+                *p_task_item = NULL;
+            }
+            *pnMatch = WMC_None;
+            hr = S_OK;
+            EPDebugLogWrite(L"taskgroup no-match-for-launcher-group hwnd=%p appid=\"%s\"", hCompareWnd, pCompareAppId ? pCompareAppId : L"");
+            return hr;
+        }
         if (bPinned)
         {
             bDontGroup = TRUE;
@@ -4017,39 +4103,7 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
 DEFINE_GUID(IID_ITaskBtnGroup,
     0x2e52265d, 0x1a3b, 0x4e46, 0x94, 0x17, 0x51, 0xa5, 0x9c, 0x47, 0xd6, 0x0b);
 
-typedef interface ITaskItem ITaskItem;
 typedef interface ITaskBtnGroup ITaskBtnGroup;
-
-typedef struct ITaskItemVtbl
-{
-    BEGIN_INTERFACE
-
-    void* QueryInterface;
-    void* AddRef;
-    ULONG(STDMETHODCALLTYPE* Release)(
-        ITaskItem* This);
-    void* GetFlags;
-    void* GetLastActivatedTime;
-    void* UpdateLastActivatedTime;
-    void* GetLastInteractiveStartTime;
-    void* SetLastInteractiveStartTime;
-    void* HasBeenInteracted;
-    void* GetIconId;
-    void* SetIconId;
-    HRESULT(STDMETHODCALLTYPE* SetWindow)(
-        ITaskItem* This,
-        HWND hWnd);
-    HWND(STDMETHODCALLTYPE* GetWindow)(
-        ITaskItem* This);
-    // ...
-
-    END_INTERFACE
-} ITaskItemVtbl;
-
-interface ITaskItem
-{
-    CONST_VTBL struct ITaskItemVtbl* lpVtbl;
-};
 
 typedef struct ITaskBtnGroupVtbl
 {

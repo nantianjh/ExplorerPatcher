@@ -24,6 +24,7 @@
 #include <tlhelp32.h>
 #include <UIAutomationClient.h>
 #include <math.h>
+#include <wctype.h>
 #include "lvt.h"
 #if WITH_MAIN_PATCHER
 #include <valinet/pdb/pdb.h>
@@ -735,6 +736,458 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #pragma endregion
 
 
+#pragma region "Launcher groups"
+#if WITH_MAIN_PATCHER
+#define EP_LAUNCHER_GROUPS_REGPATH TEXT(REGPATH) TEXT("\\LauncherGroups")
+#define EP_LAUNCHER_GROUP_MAX_ITEMS 16
+#define EP_LAUNCHER_GROUP_CLASS_NAME L"EP_LauncherGroupWindow_" _T(EP_CLSID)
+#define EP_LAUNCHER_GROUP_MENU_BASE 1000
+
+typedef struct _LauncherGroupItem
+{
+    WCHAR szName[128];
+    WCHAR szPath[MAX_PATH];
+    WCHAR szArgs[512];
+    HICON hIconSmall;
+    HICON hIconLarge;
+} LauncherGroupItem;
+
+typedef struct _LauncherGroup
+{
+    WCHAR szKeyName[128];
+    WCHAR szName[128];
+    LauncherGroupItem items[EP_LAUNCHER_GROUP_MAX_ITEMS];
+    DWORD cItems;
+    HWND hWnd;
+    HICON hIconSmall;
+    HICON hIconLarge;
+    BOOL bMenuActive;
+    struct _LauncherGroup* next;
+} LauncherGroup;
+
+LauncherGroup* g_launcherGroups = NULL;
+
+void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
+{
+    if (!dst || !cchDst)
+    {
+        return;
+    }
+
+    dst[0] = L'\0';
+    if (src)
+    {
+        wcsncpy_s(dst, cchDst, src, _TRUNCATE);
+    }
+}
+
+void LauncherGroups_Trim(WCHAR* text)
+{
+    if (!text)
+    {
+        return;
+    }
+
+    WCHAR* begin = text;
+    while (*begin && iswspace(*begin))
+    {
+        begin++;
+    }
+    if (begin != text)
+    {
+        memmove(text, begin, (wcslen(begin) + 1) * sizeof(WCHAR));
+    }
+
+    size_t len = wcslen(text);
+    while (len && iswspace(text[len - 1]))
+    {
+        text[--len] = L'\0';
+    }
+}
+
+void LauncherGroups_Unquote(WCHAR* text)
+{
+    size_t len;
+    if (!text)
+    {
+        return;
+    }
+
+    LauncherGroups_Trim(text);
+    len = wcslen(text);
+    if (len >= 2 && text[0] == L'"' && text[len - 1] == L'"')
+    {
+        memmove(text, text + 1, (len - 2) * sizeof(WCHAR));
+        text[len - 2] = L'\0';
+    }
+}
+
+void LauncherGroups_ParseItemValue(LPCWSTR value, LauncherGroupItem* item)
+{
+    WCHAR buffer[1024];
+    WCHAR* firstSep;
+    WCHAR* secondSep;
+    LPCWSTR fileName;
+
+    if (!value || !item)
+    {
+        return;
+    }
+
+    ZeroMemory(item, sizeof(LauncherGroupItem));
+    LauncherGroups_CopyString(buffer, ARRAYSIZE(buffer), value);
+    firstSep = wcschr(buffer, L'|');
+
+    if (!firstSep)
+    {
+        LauncherGroups_CopyString(item->szPath, ARRAYSIZE(item->szPath), buffer);
+        LauncherGroups_Unquote(item->szPath);
+        fileName = PathFindFileNameW(item->szPath);
+        LauncherGroups_CopyString(item->szName, ARRAYSIZE(item->szName), fileName && *fileName ? fileName : item->szPath);
+        return;
+    }
+
+    *firstSep = L'\0';
+    secondSep = wcschr(firstSep + 1, L'|');
+    if (secondSep)
+    {
+        *secondSep = L'\0';
+        LauncherGroups_CopyString(item->szArgs, ARRAYSIZE(item->szArgs), secondSep + 1);
+        LauncherGroups_Trim(item->szArgs);
+    }
+
+    LauncherGroups_CopyString(item->szName, ARRAYSIZE(item->szName), buffer);
+    LauncherGroups_CopyString(item->szPath, ARRAYSIZE(item->szPath), firstSep + 1);
+    LauncherGroups_Trim(item->szName);
+    LauncherGroups_Unquote(item->szPath);
+
+    if (!item->szName[0])
+    {
+        fileName = PathFindFileNameW(item->szPath);
+        LauncherGroups_CopyString(item->szName, ARRAYSIZE(item->szName), fileName && *fileName ? fileName : item->szPath);
+    }
+}
+
+HICON LauncherGroups_LoadIconForPath(LPCWSTR path, BOOL bLarge)
+{
+    SHFILEINFOW sfi;
+    UINT flags = SHGFI_ICON | (bLarge ? SHGFI_LARGEICON : SHGFI_SMALLICON);
+    ZeroMemory(&sfi, sizeof(sfi));
+    if (path && path[0] && SHGetFileInfoW(path, 0, &sfi, sizeof(sfi), flags) && sfi.hIcon)
+    {
+        return sfi.hIcon;
+    }
+
+    return CopyIcon(LoadIconW(NULL, IDI_APPLICATION));
+}
+
+HICON LauncherGroups_CreateCompositeIcon(LauncherGroup* group, int size)
+{
+    BITMAPV5HEADER bi;
+    void* pvBits = NULL;
+    HBITMAP hbmColor = NULL;
+    HBITMAP hbmMask = NULL;
+    HDC hdcScreen = NULL;
+    HDC hdcMem = NULL;
+    HBITMAP hbmOld = NULL;
+    ICONINFO ii;
+    HICON hIcon = NULL;
+    DWORD drawCount;
+    int cell;
+
+    if (!group || !group->cItems)
+    {
+        return CopyIcon(LoadIconW(NULL, IDI_APPLICATION));
+    }
+
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = size;
+    bi.bV5Height = -size;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    hdcScreen = GetDC(NULL);
+    hbmColor = CreateDIBSection(hdcScreen, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &pvBits, NULL, 0);
+    hbmMask = CreateBitmap(size, size, 1, 1, NULL);
+    hdcMem = CreateCompatibleDC(hdcScreen);
+    if (!hbmColor || !hbmMask || !hdcMem)
+    {
+        if (hdcMem) DeleteDC(hdcMem);
+        if (hbmColor) DeleteObject(hbmColor);
+        if (hbmMask) DeleteObject(hbmMask);
+        if (hdcScreen) ReleaseDC(NULL, hdcScreen);
+        return CopyIcon(group->items[0].hIconLarge ? group->items[0].hIconLarge : LoadIconW(NULL, IDI_APPLICATION));
+    }
+
+    ZeroMemory(pvBits, size * size * 4);
+    hbmOld = SelectObject(hdcMem, hbmColor);
+    drawCount = group->cItems > 4 ? 4 : group->cItems;
+    cell = drawCount == 1 ? size : size / 2;
+
+    for (DWORD i = 0; i < drawCount; i++)
+    {
+        int x = 0;
+        int y = 0;
+        HICON hItemIcon = group->items[i].hIconLarge ? group->items[i].hIconLarge : group->items[i].hIconSmall;
+        if (drawCount > 1)
+        {
+            x = (i % 2) * cell;
+            y = (i / 2) * cell;
+        }
+        DrawIconEx(hdcMem, x, y, hItemIcon, cell, cell, 0, NULL, DI_NORMAL);
+    }
+
+    DWORD* pixels = (DWORD*)pvBits;
+    for (int i = 0; i < size * size; i++)
+    {
+        if ((pixels[i] & 0xFF000000) == 0 && (pixels[i] & 0x00FFFFFF) != 0)
+        {
+            pixels[i] |= 0xFF000000;
+        }
+    }
+
+    SelectObject(hdcMem, hbmOld);
+    ZeroMemory(&ii, sizeof(ii));
+    ii.fIcon = TRUE;
+    ii.hbmColor = hbmColor;
+    ii.hbmMask = hbmMask;
+    hIcon = CreateIconIndirect(&ii);
+
+    DeleteDC(hdcMem);
+    DeleteObject(hbmColor);
+    DeleteObject(hbmMask);
+    ReleaseDC(NULL, hdcScreen);
+    return hIcon ? hIcon : CopyIcon(group->items[0].hIconLarge ? group->items[0].hIconLarge : LoadIconW(NULL, IDI_APPLICATION));
+}
+
+BOOL LauncherGroups_LoadFromRegistry()
+{
+    HKEY hRoot = NULL;
+    DWORD index = 0;
+    LauncherGroup* tail = NULL;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    while (TRUE)
+    {
+        WCHAR szSubKey[128];
+        DWORD cchSubKey = ARRAYSIZE(szSubKey);
+        HKEY hGroupKey = NULL;
+        LauncherGroup* group = NULL;
+        DWORD type;
+        DWORD cb;
+
+        if (RegEnumKeyExW(hRoot, index++, szSubKey, &cchSubKey, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+        {
+            break;
+        }
+
+        if (RegOpenKeyExW(hRoot, szSubKey, 0, KEY_READ, &hGroupKey) != ERROR_SUCCESS)
+        {
+            continue;
+        }
+
+        group = calloc(1, sizeof(LauncherGroup));
+        if (!group)
+        {
+            RegCloseKey(hGroupKey);
+            continue;
+        }
+
+        LauncherGroups_CopyString(group->szKeyName, ARRAYSIZE(group->szKeyName), szSubKey);
+        LauncherGroups_CopyString(group->szName, ARRAYSIZE(group->szName), szSubKey);
+        cb = sizeof(group->szName);
+        type = REG_SZ;
+        RegQueryValueExW(hGroupKey, L"Name", NULL, &type, (BYTE*)group->szName, &cb);
+        group->szName[ARRAYSIZE(group->szName) - 1] = L'\0';
+
+        for (DWORD i = 0; i < EP_LAUNCHER_GROUP_MAX_ITEMS; i++)
+        {
+            WCHAR valueName[32];
+            WCHAR value[1024];
+            DWORD cbValue = sizeof(value);
+            DWORD valueType = REG_SZ;
+            swprintf_s(valueName, ARRAYSIZE(valueName), L"Item%u", i);
+            if (RegQueryValueExW(hGroupKey, valueName, NULL, &valueType, (BYTE*)value, &cbValue) != ERROR_SUCCESS || valueType != REG_SZ)
+            {
+                continue;
+            }
+            value[ARRAYSIZE(value) - 1] = L'\0';
+            LauncherGroups_ParseItemValue(value, &group->items[group->cItems]);
+            if (group->items[group->cItems].szPath[0])
+            {
+                group->items[group->cItems].hIconSmall = LauncherGroups_LoadIconForPath(group->items[group->cItems].szPath, FALSE);
+                group->items[group->cItems].hIconLarge = LauncherGroups_LoadIconForPath(group->items[group->cItems].szPath, TRUE);
+                group->cItems++;
+            }
+        }
+
+        RegCloseKey(hGroupKey);
+        if (!group->cItems)
+        {
+            free(group);
+            continue;
+        }
+
+        group->hIconSmall = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXSMICON));
+        group->hIconLarge = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXICON));
+
+        if (tail)
+        {
+            tail->next = group;
+        }
+        else
+        {
+            g_launcherGroups = group;
+        }
+        tail = group;
+    }
+
+    RegCloseKey(hRoot);
+    return g_launcherGroups != NULL;
+}
+
+void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
+{
+    HMENU hMenu;
+    POINT pt;
+    int cmd;
+
+    if (!group || group->bMenuActive)
+    {
+        return;
+    }
+
+    group->bMenuActive = TRUE;
+    hMenu = CreatePopupMenu();
+    if (!hMenu)
+    {
+        group->bMenuActive = FALSE;
+        return;
+    }
+
+    for (DWORD i = 0; i < group->cItems; i++)
+    {
+        AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_BASE + i, group->items[i].szName);
+    }
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_GRAYED, 0, EP_LAUNCHER_GROUPS_REGPATH);
+
+    GetCursorPos(&pt);
+    SetForegroundWindow(hWnd);
+    cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+    DestroyMenu(hMenu);
+
+    if (cmd >= EP_LAUNCHER_GROUP_MENU_BASE && cmd < EP_LAUNCHER_GROUP_MENU_BASE + (int)group->cItems)
+    {
+        LauncherGroupItem* item = &group->items[cmd - EP_LAUNCHER_GROUP_MENU_BASE];
+        ShellExecuteW(NULL, L"open", item->szPath, item->szArgs[0] ? item->szArgs : NULL, NULL, SW_SHOWNORMAL);
+    }
+
+    ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+    group->bMenuActive = FALSE;
+}
+
+LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    LauncherGroup* group = (LauncherGroup*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+    switch (uMsg)
+    {
+    case WM_CREATE:
+        group = (LauncherGroup*)((CREATESTRUCTW*)lParam)->lpCreateParams;
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, (LONG_PTR)group);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_RESTORE || (wParam & 0xFFF0) == SC_MAXIMIZE)
+        {
+            LauncherGroups_ShowMenu(hWnd, group);
+            return 0;
+        }
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) != WA_INACTIVE && group)
+        {
+            LauncherGroups_ShowMenu(hWnd, group);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+        return 0;
+    case WM_DESTROY:
+        if (group)
+        {
+            group->hWnd = NULL;
+        }
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+DWORD LauncherGroupsThread(DWORD unused)
+{
+    WNDCLASSW wc;
+    LauncherGroup* group;
+
+    if (!LauncherGroups_LoadFromRegistry())
+    {
+        return 0;
+    }
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = LauncherGroups_WndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = EP_LAUNCHER_GROUP_CLASS_NAME;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    for (group = g_launcherGroups; group; group = group->next)
+    {
+        group->hWnd = CreateWindowExW(
+            WS_EX_APPWINDOW,
+            EP_LAUNCHER_GROUP_CLASS_NAME,
+            group->szName,
+            WS_OVERLAPPEDWINDOW,
+            -32000,
+            -32000,
+            160,
+            80,
+            NULL,
+            NULL,
+            GetModuleHandleW(NULL),
+            group
+        );
+        if (group->hWnd)
+        {
+            SendMessageW(group->hWnd, WM_SETICON, ICON_SMALL, (LPARAM)group->hIconSmall);
+            SendMessageW(group->hWnd, WM_SETICON, ICON_BIG, (LPARAM)group->hIconLarge);
+            ShowWindow(group->hWnd, SW_SHOWMINNOACTIVE);
+        }
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    return 0;
+}
+#endif
+#pragma endregion
+
+
 #pragma region "Toggle shell features"
 // More details in explorer.exe!CTray::_HandleGlobalHotkey
 
@@ -1086,7 +1539,7 @@ HWND Win10TaskbarHooks_FindDescendantByClass(HWND hWndRoot, LPCWSTR pszClassName
     return NULL;
 }
 
-BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList, int rowColSpan)
+BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList)
 {
     RECT rc;
     if (!hWndTaskList || !GetClientRect(hWndTaskList, &rc))
@@ -1096,21 +1549,20 @@ BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList, int rowColSpan)
 
     int cx = rc.right - rc.left;
     int cy = rc.bottom - rc.top;
-    if (cx <= 0 || cy <= 0 || rowColSpan <= 0)
+    if (cx <= 0 || cy <= 0)
     {
         return FALSE;
     }
 
     int minorAxisSpan = cx >= cy ? cy : cx;
-    return minorAxisSpan + 2 >= rowColSpan * 2;
+    return minorAxisSpan >= MulDiv(50, GetDpiForWindow(hWndTaskList), 96);
 }
 
-BOOL Win10TaskbarHooks_HasMultiRowTaskList(int rowColSpan)
+BOOL Win10TaskbarHooks_HasMultiRowTaskList()
 {
     HWND hWndTray = FindWindowExW(NULL, NULL, L"Shell_TrayWnd", NULL);
     if (Win10TaskbarHooks_IsTaskListMultiRow(
-        Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass"),
-        rowColSpan))
+        Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
     {
         return TRUE;
     }
@@ -1119,8 +1571,7 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList(int rowColSpan)
     while ((hWndTray = FindWindowExW(NULL, hWndTray, L"Shell_SecondaryTrayWnd", NULL)))
     {
         if (Win10TaskbarHooks_IsTaskListMultiRow(
-            Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass"),
-            rowColSpan))
+            Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
         {
             return TRUE;
         }
@@ -1129,9 +1580,16 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList(int rowColSpan)
     return FALSE;
 }
 
+BOOL bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
+
 BOOL Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
 {
-    if (!bPinnedItemsActAsQuickLaunch || rowColBegin != 0)
+    if (groupType == TBG_LAUNCHER && rowColBegin == 0)
+    {
+        bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
+    }
+
+    if (!bPinnedItemsActAsQuickLaunch || rowColBegin <= 0 || bWin10TaskbarHooksWrappedFirstWindowRow)
     {
         return FALSE;
     }
@@ -1141,13 +1599,7 @@ BOOL Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(TBGROUPTYPE groupType, 
         return FALSE;
     }
 
-    int rowColSpan = rowColEnd - rowColBegin;
-    if (rowColSpan < 0)
-    {
-        rowColSpan = -rowColSpan;
-    }
-
-    return Win10TaskbarHooks_HasMultiRowTaskList(rowColSpan);
+    return Win10TaskbarHooks_HasMultiRowTaskList();
 }
 
 int Win10TaskbarHooks_GetNonFittingSpan(int rowColBegin, int rowColEnd)
@@ -1158,8 +1610,7 @@ int Win10TaskbarHooks_GetNonFittingSpan(int rowColBegin, int rowColEnd)
         rowColSpan = -rowColSpan;
     }
 
-    int nonFittingSpan = rowColSpan * 1024;
-    return nonFittingSpan > 32767 ? nonFittingSpan : 32767;
+    return rowColSpan + 1;
 }
 
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
@@ -1185,6 +1636,7 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
         {
             *pcxShrinkable = 0;
         }
+        bWin10TaskbarHooksWrappedFirstWindowRow = TRUE;
         return Win10TaskbarHooks_GetNonFittingSpan(rowColBegin, rowColEnd);
     }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
@@ -11282,6 +11734,8 @@ DWORD Inject(BOOL bIsExplorer)
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
     }
+
+    CreateThread(NULL, 0, LauncherGroupsThread, 0, 0, NULL);
 
     HANDLE hCombase = LoadLibraryExW(L"combase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (IsWindows11())

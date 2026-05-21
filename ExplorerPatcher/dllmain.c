@@ -1811,7 +1811,7 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
         item.iItem = 0;
         item.pszText = L"\u6B64\u5206\u7EC4\u6682\u65E0\u5E94\u7528";
         item.lParam = -1;
-        ListView_InsertItemW(group->hListView, &item);
+        SendMessageW(group->hListView, LVM_INSERTITEMW, 0, (LPARAM)&item);
     }
     else
     {
@@ -1824,7 +1824,7 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
             item.pszText = group->items[i].szName;
             item.lParam = i;
             item.iImage = i;
-            ListView_InsertItemW(group->hListView, &item);
+            SendMessageW(group->hListView, LVM_INSERTITEMW, 0, (LPARAM)&item);
         }
     }
 

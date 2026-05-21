@@ -20,7 +20,6 @@
 #pragma comment(lib, "Ole32.lib")
 #include <Propsys.h>
 #include <propkey.h>
-#include <propvarutil.h>
 #pragma comment(lib, "Propsys.lib")
 #include <commctrl.h>
 #pragma comment(lib, "Comctl32.lib")
@@ -2477,16 +2476,14 @@ void LauncherGroups_SetAppUserModelId(LauncherGroup* group)
     }
     swprintf_s(appId, ARRAYSIZE(appId), L"ExplorerPatcher.LauncherGroup.%016I64X", hash);
     PropVariantInit(&prop);
-    if (SUCCEEDED(InitPropVariantFromString(appId, &prop)))
+    prop.vt = VT_LPWSTR;
+    prop.pwszVal = appId;
+    if (SUCCEEDED(SHGetPropertyStoreForWindow(group->hWnd, &IID_IPropertyStore, (void**)&pPropertyStore)))
     {
-        if (SUCCEEDED(SHGetPropertyStoreForWindow(group->hWnd, &IID_IPropertyStore, (void**)&pPropertyStore)))
-        {
-            pPropertyStore->lpVtbl->SetValue(pPropertyStore, &PKEY_AppUserModel_ID, &prop);
-            pPropertyStore->lpVtbl->Commit(pPropertyStore);
-            pPropertyStore->lpVtbl->Release(pPropertyStore);
-            EPDebugLogWrite(L"launcher-group appid hwnd=%p group=\"%s\" appid=\"%s\"", group->hWnd, group->szName, appId);
-        }
-        PropVariantClear(&prop);
+        pPropertyStore->lpVtbl->SetValue(pPropertyStore, &PKEY_AppUserModel_ID, &prop);
+        pPropertyStore->lpVtbl->Commit(pPropertyStore);
+        pPropertyStore->lpVtbl->Release(pPropertyStore);
+        EPDebugLogWrite(L"launcher-group appid hwnd=%p group=\"%s\" appid=\"%s\"", group->hWnd, group->szName, appId);
     }
 }
 

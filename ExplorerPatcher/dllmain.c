@@ -909,6 +909,12 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_RENAME 2101
 #define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
 #define EP_LAUNCHER_GROUP_MENU_DISSOLVE 2104
+#define EP_LAUNCHER_GROUP_MENU_VIEW_FIRST 2120
+#define EP_LAUNCHER_GROUP_MENU_VIEW_LIST (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_LIST)
+#define EP_LAUNCHER_GROUP_MENU_VIEW_LARGE (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_LARGE_ICONS)
+#define EP_LAUNCHER_GROUP_MENU_VIEW_MEDIUM (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
+#define EP_LAUNCHER_GROUP_MENU_VIEW_SMALL (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_SMALL_ICONS)
+#define EP_LAUNCHER_GROUP_MENU_VIEW_LAST EP_LAUNCHER_GROUP_MENU_VIEW_SMALL
 #define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
 #define EP_LAUNCHER_GROUP_HOVER_TIMER 6151
 #define EP_LAUNCHER_GROUP_MENU_MODE_NONE 0
@@ -1369,7 +1375,7 @@ BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
         && GetTickCount() - g_launcherGroupsLastHoverTick < 400;
 }
 
-void LauncherGroups_OnTaskbarMouseMove(POINT pt)
+BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
 {
     DWORD tick = GetTickCount();
     LauncherGroup* group;
@@ -1377,7 +1383,9 @@ void LauncherGroups_OnTaskbarMouseMove(POINT pt)
     if (g_launcherGroupsLastMouseCheckTick
         && tick - g_launcherGroupsLastMouseCheckTick < 80)
     {
-        return;
+        return g_launcherGroupsLastHoverGroup
+            && tick - g_launcherGroupsLastHoverTick < 400
+            && LauncherGroups_IsTaskbarPoint(pt);
     }
 
     g_launcherGroupsLastMouseCheckTick = tick;
@@ -1387,7 +1395,7 @@ void LauncherGroups_OnTaskbarMouseMove(POINT pt)
     {
         g_launcherGroupsLastHoverGroup = NULL;
         g_launcherGroupsLastHoverTick = GetTickCount();
-        return;
+        return FALSE;
     }
 
     g_launcherGroupsLastHoverGroup = group;
@@ -1395,10 +1403,11 @@ void LauncherGroups_OnTaskbarMouseMove(POINT pt)
 
     if (group->bMenuActive || group->bAppsVisible)
     {
-        return;
+        return TRUE;
     }
 
     PostMessageW(group->hWnd, EP_LAUNCHER_GROUP_SHOW_APPS_MSG, 0, 0);
+    return TRUE;
 }
 
 BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
@@ -1569,6 +1578,31 @@ void LauncherGroups_SetViewMode(DWORD viewMode)
     }
 }
 
+BOOL LauncherGroups_WriteViewModeToRegistry(DWORD viewMode)
+{
+    HKEY hKey = NULL;
+    BOOL ok = FALSE;
+
+    viewMode = LauncherGroups_ClampViewMode(viewMode);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        ok = RegSetValueExW(hKey, EP_LAUNCHER_GROUP_VIEWMODE_VALUE, 0, REG_DWORD, (const BYTE*)&viewMode, sizeof(viewMode)) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+    }
+    return ok;
+}
+
+void LauncherGroups_SetAndSaveViewMode(DWORD viewMode)
+{
+    viewMode = LauncherGroups_ClampViewMode(viewMode);
+    LauncherGroups_SetViewMode(viewMode);
+    EPDebugLogWrite(
+        L"launcher-groups set view mode=%lu saved=%d",
+        viewMode,
+        LauncherGroups_WriteViewModeToRegistry(viewMode)
+    );
+}
+
 int LauncherGroups_GetAppsIconSize(DWORD viewMode)
 {
     switch (viewMode)
@@ -1706,36 +1740,40 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
 {
     SIZE size;
     DWORD count = group && group->cItems ? group->cItems : 1;
+    int iconSize = LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode);
+    int largeBase = max(1, GetSystemMetrics(SM_CXICON));
+    int smallBase = max(1, GetSystemMetrics(SM_CXSMICON));
 
     size.cx = 300;
     size.cy = 160;
     switch (g_launcherGroupsViewMode)
     {
     case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
-    {
-        int columns = (int)min(count, 4);
-        int rows = (int)((count + columns - 1) / columns);
-        size.cx = max(260, columns * 112 + 28);
-        size.cy = max(160, rows * 116 + 52);
-        break;
-    }
     case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
     {
         int columns = (int)min(count, 4);
         int rows = (int)((count + columns - 1) / columns);
-        size.cx = max(240, columns * 96 + 28);
-        size.cy = max(150, rows * 100 + 52);
+        int cellCx = max(iconSize + 56, MulDiv(96, iconSize, largeBase));
+        int cellCy = max(iconSize + 68, MulDiv(104, iconSize, largeBase));
+        size.cx = max(MulDiv(240, iconSize, largeBase), columns * cellCx + 28);
+        size.cy = max(MulDiv(150, iconSize, largeBase), rows * cellCy + 52);
         break;
     }
     case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
-        size.cx = 300;
-        size.cy = max(130, min(360, (int)((count + 1) / 2) * 34 + 76));
+    {
+        int rowCy = max(26, iconSize + 16);
+        size.cx = max(260, MulDiv(300, iconSize, smallBase));
+        size.cy = max(130, min(360, (int)((count + 1) / 2) * rowCy + 76));
         break;
+    }
     case LAUNCHER_GROUP_VIEW_LIST:
     default:
-        size.cx = 320;
-        size.cy = max(120, min(420, (int)count * 28 + 76));
+    {
+        int rowCy = max(24, iconSize + 12);
+        size.cx = max(300, MulDiv(320, iconSize, smallBase));
+        size.cy = max(120, min(420, (int)count * rowCy + 76));
         break;
+    }
     }
     return size;
 }
@@ -1836,6 +1874,10 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
     else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
     {
         SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(max(84, iconSize + 42), max(84, iconSize + 48)));
+    }
+    else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_SMALL_ICONS)
+    {
+        SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(max(72, iconSize + 36), max(30, iconSize + 14)));
     }
 
     LauncherGroups_ResizeAppsListView(group);
@@ -2301,6 +2343,7 @@ void LauncherGroups_LaunchItem(LauncherGroup* group, int itemIndex)
 void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
 {
     HMENU hMenu;
+    HMENU hViewMenu;
     POINT pt;
     int cmd;
     HWND hSourceWnd;
@@ -2321,6 +2364,24 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
         group->bMenuActive = FALSE;
         group->dwMenuMode = EP_LAUNCHER_GROUP_MENU_MODE_NONE;
         return;
+    }
+
+    hViewMenu = CreatePopupMenu();
+    if (hViewMenu)
+    {
+        AppendMenuW(hViewMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_VIEW_LIST, L"\u5217\u8868");
+        AppendMenuW(hViewMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_VIEW_LARGE, L"\u5927\u56FE\u6807");
+        AppendMenuW(hViewMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_VIEW_MEDIUM, L"\u4E2D\u56FE\u6807");
+        AppendMenuW(hViewMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_VIEW_SMALL, L"\u5C0F\u56FE\u6807");
+        CheckMenuRadioItem(
+            hViewMenu,
+            EP_LAUNCHER_GROUP_MENU_VIEW_FIRST,
+            EP_LAUNCHER_GROUP_MENU_VIEW_LAST,
+            EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LauncherGroups_ClampViewMode(g_launcherGroupsViewMode),
+            MF_BYCOMMAND
+        );
+        AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hViewMenu, L"\u663E\u793A\u65B9\u5F0F");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
 
     AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"\u6DFB\u52A0\u5F53\u524D\u7A97\u53E3");
@@ -2351,6 +2412,15 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
     {
         LauncherGroups_DissolveGroup(group);
         return;
+    }
+    else if (cmd >= EP_LAUNCHER_GROUP_MENU_VIEW_FIRST && cmd <= EP_LAUNCHER_GROUP_MENU_VIEW_LAST)
+    {
+        LauncherGroups_SetAndSaveViewMode((DWORD)(cmd - EP_LAUNCHER_GROUP_MENU_VIEW_FIRST));
+        LauncherGroups_UpdateAppsWindow(group);
+        if (group->bAppsVisible)
+        {
+            LauncherGroups_PositionAppsWindow(group);
+        }
     }
 
     if (!group->bAppsVisible)
@@ -3879,9 +3949,12 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
     if (nCode == HC_ACTION)
     {
         POINT pt = ((MOUSEHOOKSTRUCT*)lParam)->pt;
-        if (wParam == WM_MOUSEMOVE)
+        if (wParam == WM_MOUSEMOVE || wParam == WM_NCMOUSEMOVE || wParam == WM_MOUSEHOVER)
         {
-            LauncherGroups_OnTaskbarMouseMove(pt);
+            if (LauncherGroups_OnTaskbarMouseMove(pt))
+            {
+                return 1;
+            }
         }
         else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
         {

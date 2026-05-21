@@ -583,7 +583,7 @@
 "PinnedItemsActAsQuickLaunch"=dword:00000001
 ;b %R:1913% *
 "RemoveExtraGapAroundPinnedItems"=dword:00000000
-;z 4 %R:1914%
+;c 4 %R:1914%
 ;x 0 %R:1915%
 ;x 1 %R:1916%
 ;x 2 %R:1917%

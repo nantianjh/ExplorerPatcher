@@ -905,16 +905,14 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_RELOAD_MSG (WM_APP + 0x513)
 #define EP_LAUNCHER_GROUP_SHOW_APPS_MSG (WM_APP + 0x514)
 #define EP_LAUNCHER_GROUP_VIEWMODE_MSG (WM_APP + 0x515)
-#define EP_LAUNCHER_GROUP_MENU_BASE 1000
+#define EP_LAUNCHER_GROUP_LISTVIEW_ID 1000
 #define EP_LAUNCHER_GROUP_MENU_RENAME 2101
 #define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
 #define EP_LAUNCHER_GROUP_MENU_DISSOLVE 2104
-#define EP_LAUNCHER_GROUP_MENU_EMPTY 2105
 #define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
 #define EP_LAUNCHER_GROUP_HOVER_TIMER 6151
 #define EP_LAUNCHER_GROUP_MENU_MODE_NONE 0
 #define EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS 1
-#define EP_LAUNCHER_GROUP_MENU_MODE_APPS 2
 #define EP_LAUNCHER_GROUP_VIEWMODE_VALUE L"LauncherGroupsViewMode"
 
 typedef enum _LauncherGroupsViewMode
@@ -941,11 +939,16 @@ typedef struct _LauncherGroup
     LauncherGroupItem items[EP_LAUNCHER_GROUP_MAX_ITEMS];
     DWORD cItems;
     HWND hWnd;
+    HWND hListView;
+    HIMAGELIST hImageListSmall;
+    HIMAGELIST hImageListMedium;
+    HIMAGELIST hImageListLarge;
     HICON hIconSmall;
     HICON hIconLarge;
     BOOL bMenuActive;
     BOOL bShowSettingsAfterMenu;
     BOOL bShowAppsAfterMenu;
+    BOOL bAppsVisible;
     DWORD dwMenuMode;
     struct _LauncherGroup* next;
 } LauncherGroup;
@@ -1158,90 +1161,6 @@ HICON LauncherGroups_CreateCompositeIcon(LauncherGroup* group, int size)
     return hIcon ? hIcon : CopyIcon(group->items[0].hIconLarge ? group->items[0].hIconLarge : LoadIconW(NULL, IDI_APPLICATION));
 }
 
-int LauncherGroups_GetMenuIconSize()
-{
-    switch (g_launcherGroupsViewMode)
-    {
-    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
-        return max(48, GetSystemMetrics(SM_CXICON));
-    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
-        return GetSystemMetrics(SM_CXICON);
-    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
-        return GetSystemMetrics(SM_CXSMICON);
-    case LAUNCHER_GROUP_VIEW_LIST:
-    default:
-        return 0;
-    }
-}
-
-HICON LauncherGroups_GetMenuIconForItem(LauncherGroupItem* item)
-{
-    if (!item)
-    {
-        return NULL;
-    }
-    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_SMALL_ICONS)
-    {
-        return item->hIconSmall ? item->hIconSmall : item->hIconLarge;
-    }
-    return item->hIconLarge ? item->hIconLarge : item->hIconSmall;
-}
-
-HBITMAP LauncherGroups_CreateMenuBitmapFromIcon(HICON hIcon, int size)
-{
-    BITMAPV5HEADER bi;
-    void* pvBits = NULL;
-    HDC hdcScreen = NULL;
-    HDC hdcMem = NULL;
-    HBITMAP hbmColor = NULL;
-    HBITMAP hbmOld = NULL;
-
-    if (!hIcon || size <= 0)
-    {
-        return NULL;
-    }
-
-    ZeroMemory(&bi, sizeof(bi));
-    bi.bV5Size = sizeof(bi);
-    bi.bV5Width = size;
-    bi.bV5Height = -size;
-    bi.bV5Planes = 1;
-    bi.bV5BitCount = 32;
-    bi.bV5Compression = BI_BITFIELDS;
-    bi.bV5RedMask = 0x00FF0000;
-    bi.bV5GreenMask = 0x0000FF00;
-    bi.bV5BlueMask = 0x000000FF;
-    bi.bV5AlphaMask = 0xFF000000;
-
-    hdcScreen = GetDC(NULL);
-    hbmColor = CreateDIBSection(hdcScreen, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &pvBits, NULL, 0);
-    hdcMem = CreateCompatibleDC(hdcScreen);
-    if (!hbmColor || !hdcMem)
-    {
-        if (hdcMem) DeleteDC(hdcMem);
-        if (hbmColor) DeleteObject(hbmColor);
-        if (hdcScreen) ReleaseDC(NULL, hdcScreen);
-        return NULL;
-    }
-
-    ZeroMemory(pvBits, size * size * 4);
-    hbmOld = SelectObject(hdcMem, hbmColor);
-    DrawIconEx(hdcMem, 0, 0, hIcon, size, size, 0, NULL, DI_NORMAL);
-    DWORD* pixels = (DWORD*)pvBits;
-    for (int i = 0; i < size * size; i++)
-    {
-        if ((pixels[i] & 0xFF000000) == 0 && (pixels[i] & 0x00FFFFFF) != 0)
-        {
-            pixels[i] |= 0xFF000000;
-        }
-    }
-    SelectObject(hdcMem, hbmOld);
-
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
-    return hbmColor;
-}
-
 LauncherGroup* LauncherGroups_FindByKey(LPCWSTR keyName)
 {
     for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
@@ -1309,6 +1228,33 @@ BOOL LauncherGroups_IsPointOnPopupMenu(POINT pt)
         className[0] = L'\0';
         GetClassNameW(hWnd, className, ARRAYSIZE(className));
         if (!wcscmp(className, L"#32768"))
+        {
+            return TRUE;
+        }
+        hWnd = GetParent(hWnd);
+    }
+    return FALSE;
+}
+
+BOOL LauncherGroups_IsPointOnAppsWindow(LauncherGroup* group, POINT pt)
+{
+    HWND hWnd;
+    RECT rc;
+
+    if (!group || !group->hWnd || !IsWindow(group->hWnd))
+    {
+        return FALSE;
+    }
+
+    if (GetWindowRect(group->hWnd, &rc) && PtInRect(&rc, pt))
+    {
+        return TRUE;
+    }
+
+    hWnd = WindowFromPoint(pt);
+    while (hWnd)
+    {
+        if (hWnd == group->hWnd || hWnd == group->hListView)
         {
             return TRUE;
         }
@@ -1395,7 +1341,7 @@ LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
     return group;
 }
 
-BOOL LauncherGroups_ShouldKeepAppsMenuOpen(LauncherGroup* group)
+BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
 {
     POINT pt;
     LauncherGroup* groupAtPoint;
@@ -1406,7 +1352,7 @@ BOOL LauncherGroups_ShouldKeepAppsMenuOpen(LauncherGroup* group)
     }
 
     GetCursorPos(&pt);
-    if (LauncherGroups_IsPointOnPopupMenu(pt))
+    if (group->bMenuActive || LauncherGroups_IsPointOnPopupMenu(pt) || LauncherGroups_IsPointOnAppsWindow(group, pt))
     {
         return TRUE;
     }
@@ -1447,7 +1393,7 @@ void LauncherGroups_OnTaskbarMouseMove(POINT pt)
     g_launcherGroupsLastHoverGroup = group;
     g_launcherGroupsLastHoverTick = tick;
 
-    if (group->bMenuActive)
+    if (group->bMenuActive || group->bAppsVisible)
     {
         return;
     }
@@ -1623,23 +1569,387 @@ void LauncherGroups_SetViewMode(DWORD viewMode)
     }
 }
 
-void LauncherGroups_RefreshOpenAppsMenus()
+int LauncherGroups_GetAppsIconSize(DWORD viewMode)
 {
-    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    switch (viewMode)
     {
-        if (group->bMenuActive && group->dwMenuMode == EP_LAUNCHER_GROUP_MENU_MODE_APPS)
+    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
+        return max(48, GetSystemMetrics(SM_CXICON));
+    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
+        return GetSystemMetrics(SM_CXICON);
+    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
+    case LAUNCHER_GROUP_VIEW_LIST:
+    default:
+        return GetSystemMetrics(SM_CXSMICON);
+    }
+}
+
+DWORD LauncherGroups_GetAppsListViewStyle()
+{
+    switch (g_launcherGroupsViewMode)
+    {
+    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
+    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
+        return LVS_ICON;
+    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
+        return LVS_SMALLICON;
+    case LAUNCHER_GROUP_VIEW_LIST:
+    default:
+        return LVS_REPORT | LVS_NOCOLUMNHEADER;
+    }
+}
+
+void LauncherGroups_DestroyAppsImageLists(LauncherGroup* group)
+{
+    if (!group)
+    {
+        return;
+    }
+
+    if (group->hListView && IsWindow(group->hListView))
+    {
+        SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_SMALL, 0);
+        SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_NORMAL, 0);
+    }
+    if (group->hImageListSmall)
+    {
+        ImageList_Destroy(group->hImageListSmall);
+        group->hImageListSmall = NULL;
+    }
+    if (group->hImageListMedium)
+    {
+        ImageList_Destroy(group->hImageListMedium);
+        group->hImageListMedium = NULL;
+    }
+    if (group->hImageListLarge)
+    {
+        ImageList_Destroy(group->hImageListLarge);
+        group->hImageListLarge = NULL;
+    }
+}
+
+void LauncherGroups_CreateAppsImageLists(LauncherGroup* group)
+{
+    int smallSize = LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_SMALL_ICONS);
+    int mediumSize = LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_MEDIUM_ICONS);
+    int largeSize = LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_LARGE_ICONS);
+    int initialCount = group && group->cItems ? group->cItems : 1;
+
+    if (!group)
+    {
+        return;
+    }
+
+    LauncherGroups_DestroyAppsImageLists(group);
+    group->hImageListSmall = ImageList_Create(smallSize, smallSize, ILC_COLOR32 | ILC_MASK, initialCount, 1);
+    group->hImageListMedium = ImageList_Create(mediumSize, mediumSize, ILC_COLOR32 | ILC_MASK, initialCount, 1);
+    group->hImageListLarge = ImageList_Create(largeSize, largeSize, ILC_COLOR32 | ILC_MASK, initialCount, 1);
+
+    for (DWORD i = 0; i < group->cItems; i++)
+    {
+        LauncherGroupItem* item = &group->items[i];
+        HICON hSmallIcon = item->hIconSmall ? item->hIconSmall : item->hIconLarge;
+        HICON hLargeIcon = item->hIconLarge ? item->hIconLarge : item->hIconSmall;
+
+        if (group->hImageListSmall && hSmallIcon)
         {
-            group->bShowAppsAfterMenu = TRUE;
-            EndMenu();
+            ImageList_AddIcon(group->hImageListSmall, hSmallIcon);
+        }
+        if (group->hImageListMedium && hLargeIcon)
+        {
+            ImageList_AddIcon(group->hImageListMedium, hLargeIcon);
+        }
+        if (group->hImageListLarge && hLargeIcon)
+        {
+            ImageList_AddIcon(group->hImageListLarge, hLargeIcon);
         }
     }
 }
 
-void LauncherGroups_DestroyMenuBitmap(HBITMAP hbm)
+BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
 {
-    if (hbm)
+    if (!group || !hWnd)
     {
-        DeleteObject(hbm);
+        return FALSE;
+    }
+    if (group->hListView && IsWindow(group->hListView))
+    {
+        return TRUE;
+    }
+
+    group->hListView = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        WC_LISTVIEWW,
+        NULL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS,
+        0,
+        0,
+        0,
+        0,
+        hWnd,
+        (HMENU)EP_LAUNCHER_GROUP_LISTVIEW_ID,
+        GetModuleHandleW(NULL),
+        NULL
+    );
+    if (!group->hListView)
+    {
+        return FALSE;
+    }
+
+    SetWindowTheme(group->hListView, L"Explorer", NULL);
+    SendMessageW(group->hListView, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    ListView_SetExtendedListViewStyle(group->hListView, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP);
+    return TRUE;
+}
+
+SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
+{
+    SIZE size;
+    DWORD count = group && group->cItems ? group->cItems : 1;
+
+    size.cx = 300;
+    size.cy = 160;
+    switch (g_launcherGroupsViewMode)
+    {
+    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
+    {
+        int columns = (int)min(count, 4);
+        int rows = (int)((count + columns - 1) / columns);
+        size.cx = max(260, columns * 112 + 28);
+        size.cy = max(160, rows * 116 + 52);
+        break;
+    }
+    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
+    {
+        int columns = (int)min(count, 4);
+        int rows = (int)((count + columns - 1) / columns);
+        size.cx = max(240, columns * 96 + 28);
+        size.cy = max(150, rows * 100 + 52);
+        break;
+    }
+    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
+        size.cx = 300;
+        size.cy = max(130, min(360, (int)((count + 1) / 2) * 34 + 76));
+        break;
+    case LAUNCHER_GROUP_VIEW_LIST:
+    default:
+        size.cx = 320;
+        size.cy = max(120, min(420, (int)count * 28 + 76));
+        break;
+    }
+    return size;
+}
+
+void LauncherGroups_ResizeAppsListView(LauncherGroup* group)
+{
+    RECT rc;
+
+    if (!group || !group->hWnd || !group->hListView || !IsWindow(group->hListView))
+    {
+        return;
+    }
+
+    GetClientRect(group->hWnd, &rc);
+    MoveWindow(group->hListView, 8, 8, max(0, rc.right - 16), max(0, rc.bottom - 16), TRUE);
+    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LIST)
+    {
+        ListView_SetColumnWidth(group->hListView, 0, max(0, rc.right - 28));
+    }
+}
+
+void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
+{
+    DWORD style;
+    DWORD viewStyle;
+    int iconSize;
+
+    if (!group || !group->hWnd || !LauncherGroups_EnsureAppsListView(group->hWnd, group))
+    {
+        return;
+    }
+
+    LauncherGroups_CreateAppsImageLists(group);
+    style = (DWORD)GetWindowLongPtrW(group->hListView, GWL_STYLE);
+    style &= ~(LVS_TYPEMASK | LVS_NOCOLUMNHEADER | LVS_NOSORTHEADER);
+    viewStyle = LauncherGroups_GetAppsListViewStyle();
+    SetWindowLongPtrW(group->hListView, GWL_STYLE, style | viewStyle | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS);
+    SetWindowPos(group->hListView, NULL, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+
+    ListView_DeleteAllItems(group->hListView);
+    while (ListView_DeleteColumn(group->hListView, 0))
+    {
+    }
+
+    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LIST)
+    {
+        LVCOLUMNW column;
+        ZeroMemory(&column, sizeof(column));
+        column.mask = LVCF_WIDTH;
+        column.cx = 280;
+        ListView_InsertColumn(group->hListView, 0, &column);
+    }
+
+    SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_SMALL, (LPARAM)group->hImageListSmall);
+    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LARGE_ICONS)
+    {
+        SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)group->hImageListLarge);
+    }
+    else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
+    {
+        SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)group->hImageListMedium);
+    }
+    else
+    {
+        SendMessageW(group->hListView, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)group->hImageListSmall);
+    }
+
+    if (!group->cItems)
+    {
+        LVITEMW item;
+        ZeroMemory(&item, sizeof(item));
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = 0;
+        item.pszText = L"\u6B64\u5206\u7EC4\u6682\u65E0\u5E94\u7528";
+        item.lParam = -1;
+        ListView_InsertItemW(group->hListView, &item);
+    }
+    else
+    {
+        for (DWORD i = 0; i < group->cItems; i++)
+        {
+            LVITEMW item;
+            ZeroMemory(&item, sizeof(item));
+            item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+            item.iItem = i;
+            item.pszText = group->items[i].szName;
+            item.lParam = i;
+            item.iImage = i;
+            ListView_InsertItemW(group->hListView, &item);
+        }
+    }
+
+    iconSize = LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode);
+    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LARGE_ICONS)
+    {
+        SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(max(96, iconSize + 48), max(96, iconSize + 52)));
+    }
+    else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
+    {
+        SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(max(84, iconSize + 42), max(84, iconSize + 48)));
+    }
+
+    LauncherGroups_ResizeAppsListView(group);
+    InvalidateRect(group->hListView, NULL, TRUE);
+}
+
+void LauncherGroups_PositionAppsWindow(LauncherGroup* group)
+{
+    POINT pt;
+    MONITORINFO mi;
+    SIZE size;
+    int x;
+    int y;
+
+    if (!group || !group->hWnd)
+    {
+        return;
+    }
+
+    GetCursorPos(&pt);
+    size = LauncherGroups_GetAppsWindowSize(group);
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi))
+    {
+        mi.rcWork.left = 0;
+        mi.rcWork.top = 0;
+        mi.rcWork.right = GetSystemMetrics(SM_CXSCREEN);
+        mi.rcWork.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+
+    x = pt.x - size.cx / 2;
+    y = pt.y - size.cy - 12;
+    if (pt.y - mi.rcWork.top < size.cy + 80)
+    {
+        y = pt.y + 12;
+    }
+    if (pt.x - mi.rcWork.left < 80)
+    {
+        x = pt.x + 12;
+    }
+    else if (mi.rcWork.right - pt.x < 80)
+    {
+        x = pt.x - size.cx - 12;
+    }
+
+    x = max(mi.rcWork.left, min(x, mi.rcWork.right - size.cx));
+    y = max(mi.rcWork.top, min(y, mi.rcWork.bottom - size.cy));
+
+    ShowWindow(group->hWnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(group->hWnd, HWND_TOPMOST, x, y, size.cx, size.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(group->hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    LauncherGroups_ResizeAppsListView(group);
+}
+
+void LauncherGroups_HideAppsWindow(LauncherGroup* group)
+{
+    if (!group || !group->hWnd)
+    {
+        return;
+    }
+
+    group->bAppsVisible = FALSE;
+    KillTimer(group->hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER);
+    SetWindowPos(group->hWnd, NULL, -32000, -32000, 160, 80, SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(group->hWnd, SW_SHOWMINNOACTIVE);
+}
+
+void LauncherGroups_HideOtherAppsWindows(LauncherGroup* keepGroup)
+{
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        if (group != keepGroup && group->bAppsVisible)
+        {
+            LauncherGroups_HideAppsWindow(group);
+        }
+    }
+}
+
+void LauncherGroups_ShowAppsWindow(HWND hWnd, LauncherGroup* group)
+{
+    if (!group || !hWnd)
+    {
+        return;
+    }
+    if (group->bMenuActive)
+    {
+        group->bShowAppsAfterMenu = TRUE;
+        EndMenu();
+        return;
+    }
+    if (group->bAppsVisible)
+    {
+        LauncherGroups_PositionAppsWindow(group);
+        SetTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER, 120, NULL);
+        return;
+    }
+
+    LauncherGroups_HideOtherAppsWindows(group);
+    LauncherGroups_UpdateAppsWindow(group);
+    LauncherGroups_PositionAppsWindow(group);
+    group->bAppsVisible = TRUE;
+    SetTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER, 120, NULL);
+    EPDebugLogWrite(L"launcher-group apps window show hwnd=%p group=\"%s\" items=%lu mode=%lu", hWnd, group->szName, group->cItems, g_launcherGroupsViewMode);
+}
+
+void LauncherGroups_RefreshOpenAppsWindows()
+{
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        LauncherGroups_UpdateAppsWindow(group);
+        if (group->bAppsVisible)
+        {
+            LauncherGroups_PositionAppsWindow(group);
+        }
     }
 }
 
@@ -1813,6 +2123,7 @@ void LauncherGroups_FreeGroup(LauncherGroup* group)
         return;
     }
 
+    LauncherGroups_DestroyAppsImageLists(group);
     if (group->hIconSmall)
     {
         DestroyIcon(group->hIconSmall);
@@ -1962,6 +2273,11 @@ BOOL LauncherGroups_AddWindowToGroup(LauncherGroup* group, HWND hSourceWnd)
         {
             SendMessageW(group->hWnd, WM_SETICON, ICON_SMALL, (LPARAM)group->hIconSmall);
             SendMessageW(group->hWnd, WM_SETICON, ICON_BIG, (LPARAM)group->hIconLarge);
+            LauncherGroups_UpdateAppsWindow(group);
+            if (group->bAppsVisible)
+            {
+                LauncherGroups_PositionAppsWindow(group);
+            }
         }
     }
     LauncherGroups_PostReload();
@@ -1982,24 +2298,21 @@ void LauncherGroups_LaunchItem(LauncherGroup* group, int itemIndex)
     LauncherGroups_UpdateLastForegroundWindow(GetForegroundWindow());
 }
 
-void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group, DWORD menuMode)
+void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
 {
     HMENU hMenu;
     POINT pt;
     int cmd;
     HWND hSourceWnd;
-    HBITMAP menuBitmaps[EP_LAUNCHER_GROUP_MAX_ITEMS];
-    int menuIconSize = LauncherGroups_GetMenuIconSize();
 
     if (!group || group->bMenuActive)
     {
         return;
     }
 
-    EPDebugLogWrite(L"launcher-group menu enter hwnd=%p group=\"%s\" items=%lu mode=%lu", hWnd, group->szName, group->cItems, menuMode);
-    ZeroMemory(menuBitmaps, sizeof(menuBitmaps));
+    EPDebugLogWrite(L"launcher-group menu enter hwnd=%p group=\"%s\" items=%lu mode=settings", hWnd, group->szName, group->cItems);
     group->bMenuActive = TRUE;
-    group->dwMenuMode = menuMode;
+    group->dwMenuMode = EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS;
     group->bShowSettingsAfterMenu = FALSE;
     group->bShowAppsAfterMenu = FALSE;
     hMenu = CreatePopupMenu();
@@ -2010,63 +2323,15 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group, DWORD menuMode)
         return;
     }
 
-    if (menuMode == EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS)
-    {
-        AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"\u6DFB\u52A0\u5F53\u524D\u7A97\u53E3");
-        AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_RENAME, L"\u4FEE\u6539\u5206\u7EC4\u540D");
-        AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_DISSOLVE, L"\u89E3\u6563\u5206\u7EC4");
-    }
-    else
-    {
-        if (!group->cItems)
-        {
-            AppendMenuW(hMenu, MF_GRAYED, EP_LAUNCHER_GROUP_MENU_EMPTY, L"\u6B64\u5206\u7EC4\u6682\u65E0\u5E94\u7528");
-        }
-        for (DWORD i = 0; i < group->cItems; i++)
-        {
-            MENUITEMINFOW menuInfo;
-            ZeroMemory(&menuInfo, sizeof(menuInfo));
-            menuInfo.cbSize = sizeof(menuInfo);
-            menuInfo.fMask = MIIM_ID | MIIM_STRING;
-            menuInfo.wID = EP_LAUNCHER_GROUP_MENU_BASE + i;
-            menuInfo.dwTypeData = group->items[i].szName;
-            menuInfo.cch = (UINT)wcslen(menuInfo.dwTypeData);
-            if (menuIconSize > 0)
-            {
-                menuBitmaps[i] = LauncherGroups_CreateMenuBitmapFromIcon(
-                    LauncherGroups_GetMenuIconForItem(&group->items[i]),
-                    menuIconSize);
-                if (menuBitmaps[i])
-                {
-                    menuInfo.fMask |= MIIM_BITMAP | MIIM_DATA;
-                    menuInfo.hbmpItem = menuBitmaps[i];
-                    menuInfo.dwItemData = (ULONG_PTR)menuBitmaps[i];
-                }
-            }
-            InsertMenuItemW(hMenu, GetMenuItemCount(hMenu), TRUE, &menuInfo);
-        }
-    }
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"\u6DFB\u52A0\u5F53\u524D\u7A97\u53E3");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_RENAME, L"\u4FEE\u6539\u5206\u7EC4\u540D");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_DISSOLVE, L"\u89E3\u6563\u5206\u7EC4");
 
     GetCursorPos(&pt);
     hSourceWnd = GetForegroundWindow();
     SetForegroundWindow(hWnd);
-    if (menuMode == EP_LAUNCHER_GROUP_MENU_MODE_APPS)
-    {
-        SetTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER, 120, NULL);
-    }
     cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
-    if (menuMode == EP_LAUNCHER_GROUP_MENU_MODE_APPS)
-    {
-        KillTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER);
-    }
     DestroyMenu(hMenu);
-    for (DWORD i = 0; i < EP_LAUNCHER_GROUP_MAX_ITEMS; i++)
-    {
-        if (menuBitmaps[i])
-        {
-            LauncherGroups_DestroyMenuBitmap(menuBitmaps[i]);
-        }
-    }
 
     BOOL bShowSettingsAfterMenu = group->bShowSettingsAfterMenu;
     BOOL bShowAppsAfterMenu = group->bShowAppsAfterMenu;
@@ -2074,11 +2339,7 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group, DWORD menuMode)
     group->bShowAppsAfterMenu = FALSE;
     group->bMenuActive = FALSE;
     group->dwMenuMode = EP_LAUNCHER_GROUP_MENU_MODE_NONE;
-    if (cmd >= EP_LAUNCHER_GROUP_MENU_BASE && cmd < EP_LAUNCHER_GROUP_MENU_BASE + (int)group->cItems)
-    {
-        LauncherGroups_LaunchItem(group, cmd - EP_LAUNCHER_GROUP_MENU_BASE);
-    }
-    else if (cmd == EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND)
+    if (cmd == EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND)
     {
         LauncherGroups_AddWindowToGroup(group, hSourceWnd);
     }
@@ -2092,7 +2353,10 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group, DWORD menuMode)
         return;
     }
 
-    ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+    if (!group->bAppsVisible)
+    {
+        ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+    }
     if (bShowSettingsAfterMenu)
     {
         PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
@@ -2104,6 +2368,39 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group, DWORD menuMode)
     EPDebugLogWrite(L"launcher-group menu leave hwnd=%p group=\"%s\" cmd=%d", hWnd, group->szName, cmd);
 }
 
+void LauncherGroups_LaunchListViewItem(LauncherGroup* group, int itemIndex)
+{
+    if (!group || itemIndex < 0 || itemIndex >= (int)group->cItems)
+    {
+        return;
+    }
+
+    LauncherGroups_LaunchItem(group, itemIndex);
+    LauncherGroups_HideAppsWindow(group);
+}
+
+int LauncherGroups_HitTestListViewItem(LauncherGroup* group)
+{
+    DWORD messagePos;
+    LVHITTESTINFO hitTest;
+
+    if (!group || !group->hListView)
+    {
+        return -1;
+    }
+
+    messagePos = GetMessagePos();
+    ZeroMemory(&hitTest, sizeof(hitTest));
+    hitTest.pt.x = GET_X_LPARAM(messagePos);
+    hitTest.pt.y = GET_Y_LPARAM(messagePos);
+    ScreenToClient(group->hListView, &hitTest.pt);
+    if (ListView_HitTest(group->hListView, &hitTest) >= 0 && (hitTest.flags & LVHT_ONITEM))
+    {
+        return hitTest.iItem;
+    }
+    return -1;
+}
+
 LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     LauncherGroup* group = (LauncherGroup*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
@@ -2112,6 +2409,11 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     case WM_CREATE:
         group = (LauncherGroup*)((CREATESTRUCTW*)lParam)->lpCreateParams;
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, (LONG_PTR)group);
+        if (group)
+        {
+            group->hWnd = hWnd;
+            LauncherGroups_UpdateAppsWindow(group);
+        }
         EPDebugLogWrite(L"launcher-group create hwnd=%p group=\"%s\"", hWnd, group ? group->szName : L"");
         return 0;
     case EP_LAUNCHER_GROUP_SHOW_MENU_MSG:
@@ -2121,30 +2423,32 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             EndMenu();
             return 0;
         }
-        LauncherGroups_ShowMenu(hWnd, group, EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS);
+        LauncherGroups_ShowSettingsMenu(hWnd, group);
         return 0;
     case EP_LAUNCHER_GROUP_SHOW_APPS_MSG:
-        LauncherGroups_ShowMenu(hWnd, group, EP_LAUNCHER_GROUP_MENU_MODE_APPS);
+        LauncherGroups_ShowAppsWindow(hWnd, group);
         return 0;
     case EP_LAUNCHER_GROUP_VIEWMODE_MSG:
-        if (group && group->bMenuActive && group->dwMenuMode == EP_LAUNCHER_GROUP_MENU_MODE_APPS)
+        if (group)
         {
-            group->bShowAppsAfterMenu = TRUE;
-            EndMenu();
+            LauncherGroups_UpdateAppsWindow(group);
+            if (group->bAppsVisible)
+            {
+                LauncherGroups_PositionAppsWindow(group);
+            }
         }
         return 0;
     case WM_TIMER:
         if (wParam == EP_LAUNCHER_GROUP_HOVER_TIMER)
         {
-            if (!group || !group->bMenuActive || group->dwMenuMode != EP_LAUNCHER_GROUP_MENU_MODE_APPS)
+            if (!group || !group->bAppsVisible)
             {
                 KillTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER);
                 return 0;
             }
-            if (!LauncherGroups_ShouldKeepAppsMenuOpen(group))
+            if (!LauncherGroups_ShouldKeepAppsWindowOpen(group))
             {
-                KillTimer(hWnd, EP_LAUNCHER_GROUP_HOVER_TIMER);
-                EndMenu();
+                LauncherGroups_HideAppsWindow(group);
             }
             return 0;
         }
@@ -2152,26 +2456,70 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     case WM_SYSCOMMAND:
         if ((wParam & 0xFFF0) == SC_RESTORE || (wParam & 0xFFF0) == SC_MAXIMIZE)
         {
-            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_APPS_MSG, 0, 0);
             return 0;
         }
         break;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) != WA_INACTIVE && group)
+        if (LOWORD(wParam) != WA_INACTIVE && group && !group->bMenuActive)
         {
-            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+            PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_APPS_MSG, 0, 0);
             return 0;
+        }
+        break;
+    case WM_SIZE:
+        if (group)
+        {
+            LauncherGroups_ResizeAppsListView(group);
+        }
+        break;
+    case WM_NOTIFY:
+        if (group && ((LPNMHDR)lParam)->hwndFrom == group->hListView)
+        {
+            LPNMHDR hdr = (LPNMHDR)lParam;
+            if (hdr->code == NM_CLICK)
+            {
+                LauncherGroups_LaunchListViewItem(group, LauncherGroups_HitTestListViewItem(group));
+                return 0;
+            }
+            if (hdr->code == LVN_ITEMACTIVATE)
+            {
+                LauncherGroups_LaunchListViewItem(group, ((NMITEMACTIVATE*)lParam)->iItem);
+                return 0;
+            }
+            if (hdr->code == NM_RCLICK)
+            {
+                PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+                return 0;
+            }
+            if (hdr->code == LVN_KEYDOWN)
+            {
+                NMLVKEYDOWN* keyDown = (NMLVKEYDOWN*)lParam;
+                if (keyDown->wVKey == VK_ESCAPE)
+                {
+                    LauncherGroups_HideAppsWindow(group);
+                    return 0;
+                }
+                if (keyDown->wVKey == VK_RETURN)
+                {
+                    LauncherGroups_LaunchListViewItem(group, ListView_GetNextItem(group->hListView, -1, LVNI_SELECTED));
+                    return 0;
+                }
+            }
         }
         break;
     case WM_CONTEXTMENU:
         PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
         return 0;
     case WM_CLOSE:
-        ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
+        LauncherGroups_HideAppsWindow(group);
         return 0;
     case WM_DESTROY:
         if (group)
         {
+            LauncherGroups_DestroyAppsImageLists(group);
+            group->hListView = NULL;
+            group->bAppsVisible = FALSE;
             group->hWnd = NULL;
         }
         return 0;
@@ -2216,10 +2564,16 @@ void LauncherGroups_CreateWindowsForLoadedGroups()
 DWORD LauncherGroupsThread(DWORD unused)
 {
     WNDCLASSW wc;
+    INITCOMMONCONTROLSEX icc;
     MSG dummyMsg;
     PeekMessageW(&dummyMsg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
     g_launcherGroupsThreadId = GetCurrentThreadId();
     g_launcherGroupsViewMode = LauncherGroups_ReadViewModeFromRegistry();
+
+    ZeroMemory(&icc, sizeof(icc));
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
 
     if (!LauncherGroups_LoadFromRegistry())
     {
@@ -2258,7 +2612,7 @@ DWORD LauncherGroupsThread(DWORD unused)
         if (msg.message == EP_LAUNCHER_GROUP_VIEWMODE_MSG)
         {
             EPDebugLogWrite(L"launcher-groups view mode=%lu", g_launcherGroupsViewMode);
-            LauncherGroups_RefreshOpenAppsMenus();
+            LauncherGroups_RefreshOpenAppsWindows();
             continue;
         }
         if (msg.message == WM_QUIT)

@@ -985,13 +985,13 @@ static BOOL HideInput = FALSE;
 static LRESULT CALLBACK InputBoxProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode < HC_ACTION)
         return CallNextHookEx(0, nCode, wParam, lParam);
-    if (nCode = HCBT_ACTIVATE) {
+    if (nCode == HCBT_ACTIVATE) {
         if (HideInput == TRUE) {
             HWND TextBox = FindWindowExA((HWND)wParam, NULL, "Edit", NULL);
             SendDlgItemMessageW((HWND)wParam, GetDlgCtrlID(TextBox), EM_SETPASSWORDCHAR, L'\x25cf', 0);
         }
     }
-    if (nCode = HCBT_CREATEWND) {
+    if (nCode == HCBT_CREATEWND) {
         if (!(GetWindowLongPtr((HWND)wParam, GWL_STYLE) & WS_CHILD))
             SetWindowLongPtr((HWND)wParam, GWL_EXSTYLE, GetWindowLongPtr((HWND)wParam, GWL_EXSTYLE) | WS_EX_DLGMODALFRAME);
     }
@@ -1083,16 +1083,13 @@ HRESULT InputBox(BOOL bPassword, HWND hWnd, LPCWSTR wszPrompt, LPCWSTR wszTitle,
 
                             free(wszEvaluation2);
 
-                            if (result.bstrVal)
+                            if (result.vt == VT_BSTR && result.bstrVal)
                             {
-                                memcpy(wszAnswer, result.bstrVal, cbAnswer * sizeof(WCHAR));
+                                wcsncpy_s(wszAnswer, cbAnswer, result.bstrVal, _TRUNCATE);
                             }
-                            else
+                            else if (result.vt != VT_EMPTY)
                             {
-                                if (result.vt != VT_EMPTY)
-                                {
-                                    wszAnswer[0] = 0;
-                                }
+                                wszAnswer[0] = 0;
                             }
 
                             VariantClear(&result);

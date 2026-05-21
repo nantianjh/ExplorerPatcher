@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <Windows.h>
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
@@ -1974,6 +1976,87 @@ DWORD LauncherGroups_GetAppsListViewStyle()
     }
 }
 
+BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int* pColumns, int* pRows, int* pCellCx, int* pCellCy, int* pPaddingCx, int* pPaddingCy)
+{
+    int iconSize = LauncherGroups_GetAppsIconSize(viewMode);
+    int smallBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_SMALL_ICONS));
+    int mediumBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_MEDIUM_ICONS));
+    int largeBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_LARGE_ICONS));
+    DWORD itemCount = count ? count : 1;
+    int columns;
+    int rows;
+    int cellCx;
+    int cellCy;
+    int paddingCx;
+    int paddingCy;
+
+    switch (viewMode)
+    {
+    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
+        columns = (int)min(itemCount, 3);
+        cellCx = max(iconSize + MulDiv(56, iconSize, largeBase), MulDiv(112, iconSize, largeBase));
+        cellCy = max(iconSize + MulDiv(80, iconSize, largeBase), MulDiv(124, iconSize, largeBase));
+        paddingCx = MulDiv(24, iconSize, largeBase);
+        paddingCy = MulDiv(44, iconSize, largeBase);
+        break;
+    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
+        columns = (int)min(itemCount, 3);
+        cellCx = max(iconSize + MulDiv(46, iconSize, mediumBase), MulDiv(92, iconSize, mediumBase));
+        cellCy = max(iconSize + MulDiv(60, iconSize, mediumBase), MulDiv(100, iconSize, mediumBase));
+        paddingCx = MulDiv(24, iconSize, mediumBase);
+        paddingCy = MulDiv(40, iconSize, mediumBase);
+        break;
+    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
+        columns = (int)min(itemCount, 3);
+        cellCx = max(iconSize + MulDiv(36, iconSize, smallBase), MulDiv(60, iconSize, smallBase));
+        cellCy = max(iconSize + MulDiv(40, iconSize, smallBase), MulDiv(66, iconSize, smallBase));
+        paddingCx = MulDiv(22, iconSize, smallBase);
+        paddingCy = MulDiv(36, iconSize, smallBase);
+        break;
+    default:
+        return FALSE;
+    }
+
+    columns = max(1, columns);
+    rows = (int)((itemCount + columns - 1) / columns);
+
+    if (pColumns) *pColumns = columns;
+    if (pRows) *pRows = rows;
+    if (pCellCx) *pCellCx = cellCx;
+    if (pCellCy) *pCellCy = cellCy;
+    if (pPaddingCx) *pPaddingCx = paddingCx;
+    if (pPaddingCy) *pPaddingCy = paddingCy;
+    return TRUE;
+}
+
+void LauncherGroups_AdjustAppsWindowSizeForFrame(LauncherGroup* group, SIZE* size)
+{
+    RECT rc;
+    DWORD style = WS_OVERLAPPEDWINDOW;
+    DWORD exStyle = WS_EX_APPWINDOW | WS_EX_NOACTIVATE;
+
+    if (!size)
+    {
+        return;
+    }
+
+    if (group && group->hWnd && IsWindow(group->hWnd))
+    {
+        style = (DWORD)GetWindowLongPtrW(group->hWnd, GWL_STYLE);
+        exStyle = (DWORD)GetWindowLongPtrW(group->hWnd, GWL_EXSTYLE);
+    }
+
+    rc.left = 0;
+    rc.top = 0;
+    rc.right = size->cx;
+    rc.bottom = size->cy;
+    if (AdjustWindowRectEx(&rc, style, FALSE, exStyle))
+    {
+        size->cx = rc.right - rc.left;
+        size->cy = rc.bottom - rc.top;
+    }
+}
+
 void LauncherGroups_DestroyAppsImageLists(LauncherGroup* group)
 {
     if (!group)
@@ -2085,52 +2168,26 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
     DWORD count = group && group->cItems ? group->cItems : 1;
     int iconSize = LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode);
     int smallBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_SMALL_ICONS));
-    int mediumBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_MEDIUM_ICONS));
-    int largeBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_LARGE_ICONS));
-    int scaleBase = (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LIST || g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_SMALL_ICONS)
-        ? smallBase
-        : (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_MEDIUM_ICONS ? mediumBase : largeBase);
     int columns;
     int rows;
     int cellCx;
     int cellCy;
-    int paddingCx = MulDiv(28, iconSize, scaleBase);
-    int paddingCy = MulDiv(52, iconSize, scaleBase);
+    int paddingCx;
+    int paddingCy;
 
     size.cx = 300;
     size.cy = 160;
-    switch (g_launcherGroupsViewMode)
+    if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy))
     {
-    case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
-        columns = (int)min(count, 4);
-        rows = (int)((count + columns - 1) / columns);
-        cellCx = max(iconSize + MulDiv(84, iconSize, largeBase), MulDiv(132, iconSize, largeBase));
-        cellCy = max(iconSize + MulDiv(88, iconSize, largeBase), MulDiv(136, iconSize, largeBase));
-        size.cx = max(MulDiv(360, iconSize, largeBase), columns * cellCx + paddingCx);
-        size.cy = max(MulDiv(220, iconSize, largeBase), rows * cellCy + paddingCy);
-        break;
-    case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
-        columns = (int)min(count, 4);
-        rows = (int)((count + columns - 1) / columns);
-        cellCx = max(iconSize + MulDiv(64, iconSize, mediumBase), MulDiv(104, iconSize, mediumBase));
-        cellCy = max(iconSize + MulDiv(68, iconSize, mediumBase), MulDiv(108, iconSize, mediumBase));
-        size.cx = max(MulDiv(300, iconSize, mediumBase), columns * cellCx + paddingCx);
-        size.cy = max(MulDiv(180, iconSize, mediumBase), rows * cellCy + paddingCy);
-        break;
-    case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
-        columns = (int)min(count, 5);
-        rows = (int)((count + columns - 1) / columns);
-        cellCx = max(iconSize + MulDiv(42, iconSize, smallBase), MulDiv(70, iconSize, smallBase));
-        cellCy = max(iconSize + MulDiv(44, iconSize, smallBase), MulDiv(72, iconSize, smallBase));
-        size.cx = max(MulDiv(240, iconSize, smallBase), columns * cellCx + paddingCx);
-        size.cy = max(MulDiv(130, iconSize, smallBase), rows * cellCy + paddingCy);
-        break;
-    case LAUNCHER_GROUP_VIEW_LIST:
-    default:
+        size.cx = columns * cellCx + paddingCx;
+        size.cy = rows * cellCy + paddingCy;
+    }
+    else
+    {
         size.cx = max(MulDiv(320, iconSize, smallBase), iconSize + MulDiv(280, iconSize, smallBase));
         size.cy = max(MulDiv(120, iconSize, smallBase), (int)count * max(iconSize + MulDiv(12, iconSize, smallBase), MulDiv(28, iconSize, smallBase)) + MulDiv(76, iconSize, smallBase));
-        break;
     }
+    LauncherGroups_AdjustAppsWindowSizeForFrame(group, &size);
     return size;
 }
 
@@ -2155,12 +2212,12 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
 {
     DWORD style;
     DWORD viewStyle;
-    int iconSize;
-    int smallBase;
-    int mediumBase;
-    int largeBase;
     int spacingCx;
     int spacingCy;
+    int columns;
+    int rows;
+    int paddingCx;
+    int paddingCy;
 
     if (!group || !group->hWnd || !LauncherGroups_EnsureAppsListView(group->hWnd, group))
     {
@@ -2227,26 +2284,16 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
         }
     }
 
-    iconSize = LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode);
-    smallBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_SMALL_ICONS));
-    mediumBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_MEDIUM_ICONS));
-    largeBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_LARGE_ICONS));
-    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LARGE_ICONS)
+    if (LauncherGroups_GetAppsIconLayout(
+        g_launcherGroupsViewMode,
+        group->cItems ? group->cItems : 1,
+        &columns,
+        &rows,
+        &spacingCx,
+        &spacingCy,
+        &paddingCx,
+        &paddingCy))
     {
-        spacingCx = max(iconSize + MulDiv(84, iconSize, largeBase), MulDiv(132, iconSize, largeBase));
-        spacingCy = max(iconSize + MulDiv(88, iconSize, largeBase), MulDiv(136, iconSize, largeBase));
-        SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(spacingCx, spacingCy));
-    }
-    else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
-    {
-        spacingCx = max(iconSize + MulDiv(64, iconSize, mediumBase), MulDiv(104, iconSize, mediumBase));
-        spacingCy = max(iconSize + MulDiv(68, iconSize, mediumBase), MulDiv(108, iconSize, mediumBase));
-        SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(spacingCx, spacingCy));
-    }
-    else if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_SMALL_ICONS)
-    {
-        spacingCx = max(iconSize + MulDiv(42, iconSize, smallBase), MulDiv(70, iconSize, smallBase));
-        spacingCy = max(iconSize + MulDiv(44, iconSize, smallBase), MulDiv(72, iconSize, smallBase));
         SendMessageW(group->hListView, LVM_SETICONSPACING, 0, MAKELPARAM(spacingCx, spacingCy));
     }
 
@@ -3120,7 +3167,7 @@ BOOL CALLBACK LauncherGroups_ActivateExistingWindowEnumProc(HWND hWnd, LPARAM lP
     WCHAR path[MAX_PATH];
     WINDOWPLACEMENT placement;
 
-    if (!item || !hWnd || !IsWindow(hWnd) || LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT)) || LauncherGroups_IsTaskbarOrShellWindow(GetAncestor(hWnd, GA_ROOT)) || !LauncherGroups_GetProcessPath(hWnd, path, ARRAYSIZE(path)))
+    if (!item || !hWnd || !IsWindow(hWnd) || !IsWindowVisible(hWnd) || LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT)) || LauncherGroups_IsTaskbarOrShellWindow(GetAncestor(hWnd, GA_ROOT)) || !LauncherGroups_GetProcessPath(hWnd, path, ARRAYSIZE(path)))
     {
         return TRUE;
     }
@@ -3135,10 +3182,6 @@ BOOL CALLBACK LauncherGroups_ActivateExistingWindowEnumProc(HWND hWnd, LPARAM lP
     if (GetWindowPlacement(hWnd, &placement) && placement.showCmd == SW_SHOWMINIMIZED)
     {
         ShowWindowAsync(hWnd, SW_RESTORE);
-    }
-    else if (!IsWindowVisible(hWnd))
-    {
-        ShowWindowAsync(hWnd, SW_SHOWNORMAL);
     }
     SetForegroundWindow(hWnd);
     return FALSE;
@@ -3974,7 +4017,39 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
 DEFINE_GUID(IID_ITaskBtnGroup,
     0x2e52265d, 0x1a3b, 0x4e46, 0x94, 0x17, 0x51, 0xa5, 0x9c, 0x47, 0xd6, 0x0b);
 
+typedef interface ITaskItem ITaskItem;
 typedef interface ITaskBtnGroup ITaskBtnGroup;
+
+typedef struct ITaskItemVtbl
+{
+    BEGIN_INTERFACE
+
+    void* QueryInterface;
+    void* AddRef;
+    ULONG(STDMETHODCALLTYPE* Release)(
+        ITaskItem* This);
+    void* GetFlags;
+    void* GetLastActivatedTime;
+    void* UpdateLastActivatedTime;
+    void* GetLastInteractiveStartTime;
+    void* SetLastInteractiveStartTime;
+    void* HasBeenInteracted;
+    void* GetIconId;
+    void* SetIconId;
+    HRESULT(STDMETHODCALLTYPE* SetWindow)(
+        ITaskItem* This,
+        HWND hWnd);
+    HWND(STDMETHODCALLTYPE* GetWindow)(
+        ITaskItem* This);
+    // ...
+
+    END_INTERFACE
+} ITaskItemVtbl;
+
+interface ITaskItem
+{
+    CONST_VTBL struct ITaskItemVtbl* lpVtbl;
+};
 
 typedef struct ITaskBtnGroupVtbl
 {
@@ -4013,6 +4088,10 @@ typedef struct ITaskBtnGroupVtbl
     HRESULT(STDMETHODCALLTYPE* RemoveTaskItem)(
         ITaskBtnGroup* This);
 
+    void* RegisterTaskGroupTaskItemWithGroup;
+    void* UnregisterTaskGroupTaskItemWithGroup;
+    void* ContainsTaskGroupTaskItem;
+
     HRESULT(STDMETHODCALLTYPE* RealityCheck)(
         ITaskBtnGroup* This);
 
@@ -4029,6 +4108,52 @@ typedef struct ITaskBtnGroupVtbl
         BOOL bUseGlomState,
         BOOL bUseGlomAnim,
         int* pcxShrinkable);
+
+    void* GetLocationForItem;
+    void(STDMETHODCALLTYPE* GetLocation)(
+        ITaskBtnGroup* This,
+        int itemIndex,
+        RECT* prc);
+    void* GetRowColLocationFromIndex;
+    HRESULT(STDMETHODCALLTYPE* SetLocation)(
+        ITaskBtnGroup* This,
+        int rowCol,
+        int rowColEnd,
+        const RECT* prc);
+    void* GetX;
+    void* GetY;
+    void* InvalidateDirtyItems;
+    void* Render;
+    void* HasLayout;
+    void* CanGlom;
+    void* CanUnglom;
+    void* Glom;
+    void* IsFlashing;
+    void* GetOrdinalPosition;
+    void* SetOrdinalPosition;
+    void* AnimateFromOffset;
+    void* HandleMouseMove;
+    void* StartFlashingAnimation;
+    void* StartItemAnimation;
+    void* HasItemAnimation;
+    void* IsGroupIntersectingClipRect;
+    void* InvalidateGroupAll;
+    void* ShouldShowToolTip;
+    void* RemoveIconForAllButtons;
+    void* UpdateOverlayIcon;
+    void* GetLastItemIndex;
+    void* GetGlommableTaskItemCount;
+    void* GetFlags;
+    void* UpdateFlags;
+    void* GetGroupProgress;
+    void* ItemProgressUpdate;
+    void* HitTest;
+    int(STDMETHODCALLTYPE* GetNumItems)(
+        ITaskBtnGroup* This);
+    void* GetNumTaskGroupTaskItems;
+    ITaskItem*(STDMETHODCALLTYPE* GetTaskItem)(
+        ITaskBtnGroup* This,
+        int itemIndex);
     // ...
 
     END_INTERFACE
@@ -4095,41 +4220,6 @@ BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList)
     return minorAxisSpan >= MulDiv(50, GetDpiForWindow(hWndTaskList), 96);
 }
 
-BOOL Win10TaskbarHooks_HasMultiRowTaskList()
-{
-    HWND hWndTray = FindWindowExW(NULL, NULL, L"Shell_TrayWnd", NULL);
-    if (Win10TaskbarHooks_IsTaskListMultiRow(
-        Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
-    {
-        return TRUE;
-    }
-
-    hWndTray = NULL;
-    while ((hWndTray = FindWindowExW(NULL, hWndTray, L"Shell_SecondaryTrayWnd", NULL)))
-    {
-        if (Win10TaskbarHooks_IsTaskListMultiRow(
-            Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
-        {
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
-{
-    if (groupType == TBG_LAUNCHER || groupType == TBG_GHOST)
-    {
-        return FALSE;
-    }
-    if (rowColBegin != 0 || rowColEnd <= rowColBegin)
-    {
-        return FALSE;
-    }
-    return Win10TaskbarHooks_HasMultiRowTaskList();
-}
-
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
 int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
@@ -4149,45 +4239,328 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
-    if (Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(lastGroupType, rowColBegin, rowColEnd))
-    {
-        if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
-        {
-            *pGroupType = lastGroupType;
-            bTypeModified = FALSE;
-        }
-        if (pcxShrinkable)
-        {
-            *pcxShrinkable = 0;
-        }
-        EPDebugLogWrite(
-            L"taskbtn first-row blocked type=%d begin=%d end=%d originalSpan=%d",
-            lastGroupType,
-            rowColBegin,
-            rowColEnd,
-            ret
-        );
-        ret = 0;
-    }
-    static LONG spanLogCount = 0;
-    LONG currentSpanLogCount = InterlockedIncrement(&spanLogCount);
-    if (currentSpanLogCount <= 1000)
-    {
-        EPDebugLogWrite(
-            L"taskbtn span type=%d begin=%d end=%d ret=%d shrink=%d typeModified=%d removeGap=%lu",
-            lastGroupType,
-            rowColBegin,
-            rowColEnd,
-            ret,
-            pcxShrinkable ? *pcxShrinkable : -1,
-            bTypeModified,
-            bRemoveExtraGapAroundPinnedItems
-        );
-    }
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
     {
         *pGroupType = lastGroupType;
     }
+    return ret;
+}
+
+typedef struct _Win10TaskbarLayoutItem
+{
+    ITaskBtnGroup* group;
+    RECT rc;
+    int width;
+    int height;
+    int numItems;
+    TBGROUPTYPE groupType;
+    BOOL allowFirstRow;
+} Win10TaskbarLayoutItem;
+
+typedef int (STDMETHODCALLTYPE *CTaskListWnd_RecomputeLayout_t)(void* pTaskListWnd);
+CTaskListWnd_RecomputeLayout_t CTaskListWnd_RecomputeLayoutFunc = NULL;
+LONG g_taskbarRecomputeLayoutDepth = 0;
+
+BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup)
+{
+    ITaskItem* pTaskItem;
+    HWND hWnd;
+    BOOL isLauncherGroupWindow;
+
+    if (!pTaskBtnGroup || !pTaskBtnGroup->lpVtbl || !pTaskBtnGroup->lpVtbl->GetTaskItem)
+    {
+        return FALSE;
+    }
+
+    pTaskItem = pTaskBtnGroup->lpVtbl->GetTaskItem(pTaskBtnGroup, 0);
+    if (!pTaskItem || !pTaskItem->lpVtbl || !pTaskItem->lpVtbl->GetWindow)
+    {
+        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->Release)
+        {
+            pTaskItem->lpVtbl->Release(pTaskItem);
+        }
+        return FALSE;
+    }
+
+    hWnd = pTaskItem->lpVtbl->GetWindow(pTaskItem);
+    isLauncherGroupWindow = LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT));
+    pTaskItem->lpVtbl->Release(pTaskItem);
+    return isLauncherGroupWindow;
+}
+
+int Win10TaskbarHooks_CompareLayoutItems(const void* a, const void* b)
+{
+    const Win10TaskbarLayoutItem* itemA = (const Win10TaskbarLayoutItem*)a;
+    const Win10TaskbarLayoutItem* itemB = (const Win10TaskbarLayoutItem*)b;
+
+    if (itemA->rc.top != itemB->rc.top)
+    {
+        return itemA->rc.top - itemB->rc.top;
+    }
+    return itemA->rc.left - itemB->rc.left;
+}
+
+int Win10TaskbarHooks_AppendLayoutClass(Win10TaskbarLayoutItem* dst, Win10TaskbarLayoutItem* src, int count, BOOL allowFirstRow)
+{
+    int written = 0;
+    for (int i = 0; i < count; i++)
+    {
+        if (src[i].allowFirstRow == allowFirstRow)
+        {
+            dst[written++] = src[i];
+        }
+    }
+    return written;
+}
+
+void Win10TaskbarHooks_SetPackedLocation(
+    Win10TaskbarLayoutItem* item,
+    int row,
+    int x,
+    int y,
+    int rowHeight)
+{
+    RECT rc;
+    int rowColEnd;
+
+    if (!item || !item->group || !item->group->lpVtbl || !item->group->lpVtbl->SetLocation)
+    {
+        return;
+    }
+
+    rc.left = x;
+    rc.top = y;
+    rc.right = x + item->width;
+    rc.bottom = y + item->height;
+    if (rowHeight > item->height)
+    {
+        rc.top += (rowHeight - item->height) / 2;
+        rc.bottom = rc.top + item->height;
+    }
+
+    rowColEnd = item->numItems > 1 ? item->numItems - 1 : -1;
+    item->group->lpVtbl->SetLocation(item->group, row, rowColEnd, &rc);
+}
+
+void Win10TaskbarHooks_PackLayoutItems(
+    Win10TaskbarLayoutItem* items,
+    int count,
+    int startIndex,
+    int endIndex,
+    int* pRow,
+    int* pX,
+    int startX,
+    int right,
+    int firstRowTop,
+    int rowHeight)
+{
+    int row = pRow ? *pRow : 0;
+    int x = pX ? *pX : startX;
+
+    UNREFERENCED_PARAMETER(count);
+
+    for (int i = startIndex; i < endIndex; i++)
+    {
+        int width = items[i].width;
+        if (x > startX && x + width > right)
+        {
+            row++;
+            x = startX;
+        }
+
+        Win10TaskbarHooks_SetPackedLocation(
+            &items[i],
+            row,
+            x,
+            firstRowTop + row * rowHeight,
+            rowHeight);
+        x += width;
+    }
+
+    if (pRow) *pRow = row;
+    if (pX) *pX = x;
+}
+
+void Win10TaskbarHooks_ReserveFirstRowForPinnedAndLauncherGroups(void* pTaskListWnd)
+{
+    HWND hWndTaskList;
+    RECT rcClient;
+    HDPA hdpaGroups;
+    int count;
+    Win10TaskbarLayoutItem* items;
+    Win10TaskbarLayoutItem* ordered;
+    int itemCount = 0;
+    int firstRowTop = INT_MAX;
+    int rowHeight = 0;
+    int secondRowTop = INT_MAX;
+    int startX = INT_MAX;
+    int allowCount;
+    int row;
+    int x;
+
+    if (!pTaskListWnd)
+    {
+        return;
+    }
+
+    hWndTaskList = *(HWND*)((PBYTE)pTaskListWnd + 8);
+    if (!hWndTaskList || !IsWindow(hWndTaskList) || !Win10TaskbarHooks_IsTaskListMultiRow(hWndTaskList))
+    {
+        return;
+    }
+    if (!GetClientRect(hWndTaskList, &rcClient) || rcClient.right <= rcClient.left || rcClient.bottom <= rcClient.top)
+    {
+        return;
+    }
+    if ((rcClient.right - rcClient.left) < (rcClient.bottom - rcClient.top))
+    {
+        return;
+    }
+
+    hdpaGroups = *(HDPA*)((PBYTE)pTaskListWnd + 0xd8);
+    count = hdpaGroups ? DPA_GetPtrCount(hdpaGroups) : 0;
+    if (count <= 1)
+    {
+        return;
+    }
+
+    items = (Win10TaskbarLayoutItem*)calloc(count, sizeof(Win10TaskbarLayoutItem));
+    ordered = (Win10TaskbarLayoutItem*)calloc(count, sizeof(Win10TaskbarLayoutItem));
+    if (!items || !ordered)
+    {
+        if (items) free(items);
+        if (ordered) free(ordered);
+        return;
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        ITaskBtnGroup* pTaskBtnGroup = (ITaskBtnGroup*)DPA_GetPtr(hdpaGroups, i);
+        RECT rc;
+        int width;
+        int height;
+
+        if (!pTaskBtnGroup || !pTaskBtnGroup->lpVtbl || !pTaskBtnGroup->lpVtbl->GetLocation || !pTaskBtnGroup->lpVtbl->GetGroupType)
+        {
+            continue;
+        }
+
+        ZeroMemory(&rc, sizeof(rc));
+        pTaskBtnGroup->lpVtbl->GetLocation(pTaskBtnGroup, -1, &rc);
+        width = rc.right - rc.left;
+        height = rc.bottom - rc.top;
+        if (width <= 0 || height <= 0)
+        {
+            continue;
+        }
+
+        items[itemCount].group = pTaskBtnGroup;
+        items[itemCount].rc = rc;
+        items[itemCount].width = width;
+        items[itemCount].height = height;
+        items[itemCount].numItems = pTaskBtnGroup->lpVtbl->GetNumItems ? pTaskBtnGroup->lpVtbl->GetNumItems(pTaskBtnGroup) : 1;
+        items[itemCount].groupType = (TBGROUPTYPE)pTaskBtnGroup->lpVtbl->GetGroupType(pTaskBtnGroup);
+        items[itemCount].allowFirstRow =
+            items[itemCount].groupType == TBG_LAUNCHER
+            || items[itemCount].groupType == TBG_GHOST
+            || Win10TaskbarHooks_IsLauncherGroupTaskButton(pTaskBtnGroup);
+
+        firstRowTop = min(firstRowTop, rc.top);
+        startX = min(startX, rc.left);
+        rowHeight = max(rowHeight, height);
+        itemCount++;
+    }
+
+    if (itemCount <= 0 || firstRowTop == INT_MAX || startX == INT_MAX || rowHeight <= 0)
+    {
+        free(items);
+        free(ordered);
+        return;
+    }
+
+    qsort(items, itemCount, sizeof(Win10TaskbarLayoutItem), Win10TaskbarHooks_CompareLayoutItems);
+    for (int i = 0; i < itemCount; i++)
+    {
+        if (items[i].rc.top > firstRowTop + rowHeight / 2)
+        {
+            secondRowTop = min(secondRowTop, items[i].rc.top);
+        }
+    }
+    if (secondRowTop != INT_MAX && secondRowTop > firstRowTop)
+    {
+        rowHeight = secondRowTop - firstRowTop;
+    }
+
+    allowCount = Win10TaskbarHooks_AppendLayoutClass(ordered, items, itemCount, TRUE);
+    Win10TaskbarHooks_AppendLayoutClass(ordered + allowCount, items, itemCount, FALSE);
+    if (allowCount >= itemCount)
+    {
+        free(items);
+        free(ordered);
+        return;
+    }
+
+    row = 0;
+    x = startX;
+    if (allowCount > 0)
+    {
+        Win10TaskbarHooks_PackLayoutItems(
+            ordered,
+            itemCount,
+            0,
+            allowCount,
+            &row,
+            &x,
+            startX,
+            rcClient.right,
+            firstRowTop,
+            rowHeight);
+    }
+
+    if (allowCount <= 0 || row == 0)
+    {
+        row = 1;
+        x = startX;
+    }
+    Win10TaskbarHooks_PackLayoutItems(
+        ordered,
+        itemCount,
+        allowCount,
+        itemCount,
+        &row,
+        &x,
+        startX,
+        rcClient.right,
+        firstRowTop,
+        rowHeight);
+
+    EPDebugLogWrite(
+        L"taskbar first row reserved hwnd=%p count=%d allow=%d rowHeight=%d",
+        hWndTaskList,
+        itemCount,
+        allowCount,
+        rowHeight);
+
+    free(items);
+    free(ordered);
+}
+
+int STDMETHODCALLTYPE CTaskListWnd_RecomputeLayoutHook(void* pTaskListWnd)
+{
+    LONG depth = InterlockedIncrement(&g_taskbarRecomputeLayoutDepth);
+    int ret = CTaskListWnd_RecomputeLayoutFunc(pTaskListWnd);
+    if (depth == 1)
+    {
+        __try
+        {
+            Win10TaskbarHooks_ReserveFirstRowForPinnedAndLauncherGroups(pTaskListWnd);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            EPDebugLogWrite(L"taskbar first row reserve skipped after exception");
+        }
+    }
+    InterlockedDecrement(&g_taskbarRecomputeLayoutDepth);
     return ret;
 }
 
@@ -4210,7 +4583,7 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (pVtbl)
+    if (pVtbl && bRemoveExtraGapAroundPinnedItems)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))
@@ -4256,6 +4629,35 @@ void Win10TaskbarHooks_PatchEPTaskbarVtables(HMODULE hModule)
     if (pTaskBtnGroupVtbl)
     {
         Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(pTaskBtnGroupVtbl);
+    }
+}
+
+void Win10TaskbarHooks_PatchEPTaskbarLayout(HMODULE hModule)
+{
+    int rv;
+
+    if (!hModule || CTaskListWnd_RecomputeLayoutFunc)
+    {
+        return;
+    }
+
+    CTaskListWnd_RecomputeLayoutFunc = (CTaskListWnd_RecomputeLayout_t)GetProcAddress(
+        hModule,
+        "?_RecomputeLayout@CTaskListWnd@@IEAAHXZ");
+    if (!CTaskListWnd_RecomputeLayoutFunc)
+    {
+        EPDebugLogWrite(L"taskbar layout hook target not found");
+        return;
+    }
+
+    rv = funchook_prepare(
+        funchook,
+        (void**)&CTaskListWnd_RecomputeLayoutFunc,
+        CTaskListWnd_RecomputeLayoutHook);
+    EPDebugLogWrite(L"taskbar layout hook install rv=%d target=%p", rv, CTaskListWnd_RecomputeLayoutFunc);
+    if (rv != 0)
+    {
+        CTaskListWnd_RecomputeLayoutFunc = NULL;
     }
 }
 #endif
@@ -14413,7 +14815,8 @@ DWORD Inject(BOOL bIsExplorer)
         VnPatchIAT(hMyTaskbar, "uxtheme.dll", MAKEINTRESOURCEA(126), PeopleBand_DrawTextWithGlowHook);
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
-        EPDebugLogWrite(L"taskbar vtable hooks installed pinnedQuickLaunch=%lu removeGap=%lu", bPinnedItemsActAsQuickLaunch, bRemoveExtraGapAroundPinnedItems);
+        Win10TaskbarHooks_PatchEPTaskbarLayout(hMyTaskbar);
+        EPDebugLogWrite(L"taskbar hooks installed pinnedQuickLaunch=%lu removeGap=%lu", bPinnedItemsActAsQuickLaunch, bRemoveExtraGapAroundPinnedItems);
     }
 
     CreateThread(NULL, 0, LauncherGroupsThread, 0, 0, NULL);

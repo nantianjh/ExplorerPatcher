@@ -1591,15 +1591,14 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
         BOOL bDontGroup = FALSE;
         PBYTE _this = (PBYTE)pTaskGroup - 16 /*sizeof(CTaskUnknown)*/;
         HDPA hdpaItems = *(HDPA*)(_this + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
-        BOOL bPinned = !hdpaItems || !DPA_GetPtrCount(hdpaItems);
+        int itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
+        BOOL bPinned = itemCount == 0;
         if (bPinned)
         {
             bDontGroup = TRUE;
         }
         if (bDontGroup)
         {
-            HDPA hdpaItems = *(HDPA*)((PBYTE)pTaskGroup - 16 /*sizeof(CTaskUnknown)*/ + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
-            int itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
             EPDebugLogWrite(
                 L"taskgroup no-match-for-quick-launch hwnd=%p match=%d itemCount=%d appid=\"%s\"",
                 hCompareWnd,
@@ -1767,46 +1766,6 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList()
     return FALSE;
 }
 
-BOOL bWin10TaskbarHooksSawLauncherRow = FALSE;
-BOOL bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
-
-BOOL Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
-{
-    if (groupType == TBG_LAUNCHER)
-    {
-        if (rowColBegin == 0)
-        {
-            bWin10TaskbarHooksSawLauncherRow = FALSE;
-            bWin10TaskbarHooksWrappedFirstWindowRow = FALSE;
-        }
-        bWin10TaskbarHooksSawLauncherRow = TRUE;
-        return FALSE;
-    }
-
-    if (!bPinnedItemsActAsQuickLaunch || !bWin10TaskbarHooksSawLauncherRow || bWin10TaskbarHooksWrappedFirstWindowRow)
-    {
-        return FALSE;
-    }
-
-    if (groupType != TBG_SWITCHER && groupType != TBG_GLOM)
-    {
-        return FALSE;
-    }
-
-    return Win10TaskbarHooks_HasMultiRowTaskList();
-}
-
-int Win10TaskbarHooks_GetNonFittingSpan(int rowColBegin, int rowColEnd)
-{
-    int rowColSpan = rowColEnd - rowColBegin;
-    if (rowColSpan < 0)
-    {
-        rowColSpan = -rowColSpan;
-    }
-
-    return rowColSpan + 1;
-}
-
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
 int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
@@ -1824,23 +1783,6 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
         *pGroupType = TBG_GHOST;
         bTypeModified = TRUE;
     }
-    if (Win10TaskbarHooks_ShouldReserveFirstRowForLaunchers(lastGroupType, rowColBegin, rowColEnd))
-    {
-        if (pcxShrinkable)
-        {
-            *pcxShrinkable = 0;
-        }
-        bWin10TaskbarHooksWrappedFirstWindowRow = TRUE;
-        int nonFittingSpan = Win10TaskbarHooks_GetNonFittingSpan(rowColBegin, rowColEnd);
-        EPDebugLogWrite(
-            L"taskbtn force-window-wrap type=%d begin=%d end=%d span=%d",
-            lastGroupType,
-            rowColBegin,
-            rowColEnd,
-            nonFittingSpan
-        );
-        return nonFittingSpan;
-    }
     int ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
     static LONG spanLogCount = 0;
@@ -1848,14 +1790,14 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     if (currentSpanLogCount <= 1000)
     {
         EPDebugLogWrite(
-            L"taskbtn span type=%d begin=%d end=%d ret=%d shrink=%d sawLauncher=%d wrapped=%d",
+            L"taskbtn span type=%d begin=%d end=%d ret=%d shrink=%d typeModified=%d removeGap=%lu",
             lastGroupType,
             rowColBegin,
             rowColEnd,
             ret,
             pcxShrinkable ? *pcxShrinkable : -1,
-            bWin10TaskbarHooksSawLauncherRow,
-            bWin10TaskbarHooksWrappedFirstWindowRow
+            bTypeModified,
+            bRemoveExtraGapAroundPinnedItems
         );
     }
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
@@ -1884,7 +1826,7 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (bRemoveExtraGapAroundPinnedItems || bPinnedItemsActAsQuickLaunch)
+    if (bRemoveExtraGapAroundPinnedItems)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))

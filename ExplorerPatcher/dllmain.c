@@ -3991,6 +3991,20 @@ interface ITaskItem
     CONST_VTBL struct ITaskItemVtbl* lpVtbl;
 };
 
+void Win10TaskbarHooks_ReleaseTaskItem(ITaskItem* pTaskItem)
+{
+    __try
+    {
+        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->Release)
+        {
+            pTaskItem->lpVtbl->Release(pTaskItem);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
 typedef struct ITaskGroupVtbl
 {
     BEGIN_INTERFACE
@@ -4050,19 +4064,38 @@ HRESULT(STDMETHODCALLTYPE *CTaskGroup_DoesWindowMatchFunc)(ITaskGroup* pTaskGrou
 HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup, HWND hCompareWnd, ITEMIDLIST* pCompareItemIdList,
     WCHAR* pCompareAppId, WINDOWMATCHCONFIDENCE* pnMatch, ITaskItem** p_task_item)
 {
+    if (!CTaskGroup_DoesWindowMatchFunc)
+    {
+        return E_FAIL;
+    }
+
     HRESULT hr = CTaskGroup_DoesWindowMatchFunc(pTaskGroup, hCompareWnd, pCompareItemIdList, pCompareAppId, pnMatch, p_task_item);
     if (bPinnedItemsActAsQuickLaunch && SUCCEEDED(hr) && pnMatch
         && (*pnMatch == WMC_MatchAppID || *pnMatch == WMC_MatchShortcutIDListByAppID || *pnMatch == WMC_MatchShortcutIDList))
     {
         BOOL bDontGroup = FALSE;
+        int itemCount = 0;
         PBYTE _this = (PBYTE)pTaskGroup - 16 /*sizeof(CTaskUnknown)*/;
-        HDPA hdpaItems = *(HDPA*)(_this + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
-        int itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
-        BOOL bPinned = itemCount == 0;
+        HDPA hdpaItems = NULL;
+        BOOL bPinned;
+
+        __try
+        {
+            hdpaItems = *(HDPA*)(_this + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
+            itemCount = hdpaItems ? DPA_GetPtrCount(hdpaItems) : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            EPDebugLogWrite(L"taskgroup match skipped after exception hwnd=%p appid=\"%s\"", hCompareWnd, pCompareAppId ? pCompareAppId : L"");
+            return hr;
+        }
+
+        bPinned = itemCount == 0;
         if (LauncherGroups_IsLauncherGroupWindow(GetAncestor(hCompareWnd, GA_ROOT)))
         {
             if (p_task_item)
             {
+                Win10TaskbarHooks_ReleaseTaskItem(*p_task_item);
                 *p_task_item = NULL;
             }
             *pnMatch = WMC_None;
@@ -4089,6 +4122,7 @@ HRESULT STDMETHODCALLTYPE CTaskGroup_DoesWindowMatchHook(ITaskGroup* pTaskGroup,
             }
             if (p_task_item)
             {
+                Win10TaskbarHooks_ReleaseTaskItem(*p_task_item);
                 *p_task_item = NULL;
             }
             hr = S_OK;
@@ -4279,20 +4313,50 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
     int* pcxShrinkable)
 {
+    if (!CTaskBtnGroup_GetIdealSpanFunc || !pTaskBtnGroup)
+    {
+        return 0;
+    }
+
     BOOL bTypeModified = FALSE;
     PBYTE _this = (PBYTE)pTaskBtnGroup - 16 /*sizeof(CTaskUnknown)*/;
     TBGROUPTYPE* pGroupType = (TBGROUPTYPE*)(_this + 80 /*offsetof(CTaskBtnGroup, m_groupType)*/);
-    TBGROUPTYPE lastGroupType = *pGroupType;
+    TBGROUPTYPE lastGroupType = TBG_UNKNOWN;
+    int ret;
+
+    __try
+    {
+        lastGroupType = *pGroupType;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return CTaskBtnGroup_GetIdealSpanFunc(
+            pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
+    }
+
     if (bRemoveExtraGapAroundPinnedItems && lastGroupType == TBG_LAUNCHER)
     {
-        *pGroupType = TBG_GHOST;
-        bTypeModified = TRUE;
+        __try
+        {
+            *pGroupType = TBG_GHOST;
+            bTypeModified = TRUE;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            bTypeModified = FALSE;
+        }
     }
-    int ret = CTaskBtnGroup_GetIdealSpanFunc(
+    ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
     {
-        *pGroupType = lastGroupType;
+        __try
+        {
+            *pGroupType = lastGroupType;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
     }
     return ret;
 }
@@ -4314,28 +4378,30 @@ LONG g_taskbarRecomputeLayoutDepth = 0;
 
 BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup)
 {
-    ITaskItem* pTaskItem;
-    HWND hWnd;
-    BOOL isLauncherGroupWindow;
+    ITaskItem* pTaskItem = NULL;
+    HWND hWnd = NULL;
+    BOOL isLauncherGroupWindow = FALSE;
 
     if (!pTaskBtnGroup || !pTaskBtnGroup->lpVtbl || !pTaskBtnGroup->lpVtbl->GetTaskItem)
     {
         return FALSE;
     }
 
-    pTaskItem = pTaskBtnGroup->lpVtbl->GetTaskItem(pTaskBtnGroup, 0);
-    if (!pTaskItem || !pTaskItem->lpVtbl || !pTaskItem->lpVtbl->GetWindow)
+    __try
     {
-        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->Release)
+        pTaskItem = pTaskBtnGroup->lpVtbl->GetTaskItem(pTaskBtnGroup, 0);
+        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->GetWindow)
         {
-            pTaskItem->lpVtbl->Release(pTaskItem);
+            hWnd = pTaskItem->lpVtbl->GetWindow(pTaskItem);
+            isLauncherGroupWindow = hWnd && IsWindow(hWnd) && LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT));
         }
-        return FALSE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        isLauncherGroupWindow = FALSE;
     }
 
-    hWnd = pTaskItem->lpVtbl->GetWindow(pTaskItem);
-    isLauncherGroupWindow = LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT));
-    pTaskItem->lpVtbl->Release(pTaskItem);
+    Win10TaskbarHooks_ReleaseTaskItem(pTaskItem);
     return isLauncherGroupWindow;
 }
 
@@ -4390,7 +4456,14 @@ void Win10TaskbarHooks_SetPackedLocation(
     }
 
     rowColEnd = item->numItems > 1 ? item->numItems - 1 : -1;
-    item->group->lpVtbl->SetLocation(item->group, row, rowColEnd, &rc);
+    __try
+    {
+        item->group->lpVtbl->SetLocation(item->group, row, rowColEnd, &rc);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        EPDebugLogWrite(L"taskbar set location skipped after exception group=%p", item->group);
+    }
 }
 
 void Win10TaskbarHooks_PackLayoutItems(
@@ -4497,20 +4570,28 @@ void Win10TaskbarHooks_ReserveFirstRowForPinnedAndLauncherGroups(void* pTaskList
         }
 
         ZeroMemory(&rc, sizeof(rc));
-        pTaskBtnGroup->lpVtbl->GetLocation(pTaskBtnGroup, -1, &rc);
-        width = rc.right - rc.left;
-        height = rc.bottom - rc.top;
-        if (width <= 0 || height <= 0)
+        __try
+        {
+            pTaskBtnGroup->lpVtbl->GetLocation(pTaskBtnGroup, -1, &rc);
+            width = rc.right - rc.left;
+            height = rc.bottom - rc.top;
+            if (width <= 0 || height <= 0)
+            {
+                continue;
+            }
+
+            items[itemCount].group = pTaskBtnGroup;
+            items[itemCount].rc = rc;
+            items[itemCount].width = width;
+            items[itemCount].height = height;
+            items[itemCount].numItems = pTaskBtnGroup->lpVtbl->GetNumItems ? pTaskBtnGroup->lpVtbl->GetNumItems(pTaskBtnGroup) : 1;
+            items[itemCount].groupType = (TBGROUPTYPE)pTaskBtnGroup->lpVtbl->GetGroupType(pTaskBtnGroup);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
         {
             continue;
         }
 
-        items[itemCount].group = pTaskBtnGroup;
-        items[itemCount].rc = rc;
-        items[itemCount].width = width;
-        items[itemCount].height = height;
-        items[itemCount].numItems = pTaskBtnGroup->lpVtbl->GetNumItems ? pTaskBtnGroup->lpVtbl->GetNumItems(pTaskBtnGroup) : 1;
-        items[itemCount].groupType = (TBGROUPTYPE)pTaskBtnGroup->lpVtbl->GetGroupType(pTaskBtnGroup);
         items[itemCount].allowFirstRow =
             items[itemCount].groupType == TBG_LAUNCHER
             || items[itemCount].groupType == TBG_GHOST
@@ -4599,7 +4680,15 @@ void Win10TaskbarHooks_ReserveFirstRowForPinnedAndLauncherGroups(void* pTaskList
 int STDMETHODCALLTYPE CTaskListWnd_RecomputeLayoutHook(void* pTaskListWnd)
 {
     LONG depth = InterlockedIncrement(&g_taskbarRecomputeLayoutDepth);
-    int ret = CTaskListWnd_RecomputeLayoutFunc(pTaskListWnd);
+    int ret;
+
+    if (!CTaskListWnd_RecomputeLayoutFunc)
+    {
+        InterlockedDecrement(&g_taskbarRecomputeLayoutDepth);
+        return 0;
+    }
+
+    ret = CTaskListWnd_RecomputeLayoutFunc(pTaskListWnd);
     if (depth == 1)
     {
         __try
@@ -4617,7 +4706,7 @@ int STDMETHODCALLTYPE CTaskListWnd_RecomputeLayoutHook(void* pTaskListWnd)
 
 void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 {
-    if (bPinnedItemsActAsQuickLaunch)
+    if (pVtbl && pVtbl->DoesWindowMatch && pVtbl->DoesWindowMatch != CTaskGroup_DoesWindowMatchHook && bPinnedItemsActAsQuickLaunch)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))
@@ -4634,7 +4723,7 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (pVtbl && bRemoveExtraGapAroundPinnedItems)
+    if (pVtbl && pVtbl->GetIdealSpan && pVtbl->GetIdealSpan != CTaskBtnGroup_GetIdealSpanHook && bRemoveExtraGapAroundPinnedItems)
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))
@@ -4654,15 +4743,31 @@ HRESULT explorer_QISearch(void* that, LPCQITAB pqit, REFIID riid, void** ppv)
     HRESULT hr = QISearch(that, pqit, riid, ppv);
     if (SUCCEEDED(hr))
     {
+        if (!that || !pqit || !pqit[0].piid)
+        {
+            return hr;
+        }
         if (IsEqualGUID(pqit[0].piid, &IID_ITaskGroup))
         {
             ITaskGroup* pTaskGroup = (char*)that + pqit[0].dwOffset;
-            Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(pTaskGroup->lpVtbl);
+            __try
+            {
+                Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(pTaskGroup->lpVtbl);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
         }
         else if (IsEqualGUID(pqit[0].piid, &IID_ITaskBtnGroup))
         {
             ITaskBtnGroup* pTaskBtnGroup = (char*)that + pqit[0].dwOffset;
-            Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(pTaskBtnGroup->lpVtbl);
+            __try
+            {
+                Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(pTaskBtnGroup->lpVtbl);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
         }
     }
     return hr;

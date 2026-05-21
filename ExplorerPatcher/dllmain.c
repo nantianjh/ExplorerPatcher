@@ -3991,11 +3991,30 @@ interface ITaskItem
     CONST_VTBL struct ITaskItemVtbl* lpVtbl;
 };
 
+BOOL Win10TaskbarHooks_IsExecutablePointer(void* p)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD protect;
+
+    if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
+    {
+        return FALSE;
+    }
+
+    protect = mbi.Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
+    return protect == PAGE_EXECUTE
+        || protect == PAGE_EXECUTE_READ
+        || protect == PAGE_EXECUTE_READWRITE
+        || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
 void Win10TaskbarHooks_ReleaseTaskItem(ITaskItem* pTaskItem)
 {
     __try
     {
-        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->Release)
+        if (pTaskItem
+            && pTaskItem->lpVtbl
+            && Win10TaskbarHooks_IsExecutablePointer(pTaskItem->lpVtbl->Release))
         {
             pTaskItem->lpVtbl->Release(pTaskItem);
         }
@@ -4305,6 +4324,51 @@ BOOL Win10TaskbarHooks_IsTaskListMultiRow(HWND hWndTaskList)
     return minorAxisSpan >= MulDiv(50, GetDpiForWindow(hWndTaskList), 96);
 }
 
+BOOL Win10TaskbarHooks_HasMultiRowTaskList()
+{
+    HWND hWndTray = FindWindowExW(NULL, NULL, L"Shell_TrayWnd", NULL);
+    if (Win10TaskbarHooks_IsTaskListMultiRow(
+        Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
+    {
+        return TRUE;
+    }
+
+    hWndTray = NULL;
+    while ((hWndTray = FindWindowExW(NULL, hWndTray, L"Shell_SecondaryTrayWnd", NULL)))
+    {
+        if (Win10TaskbarHooks_IsTaskListMultiRow(
+            Win10TaskbarHooks_FindDescendantByClass(hWndTray, L"MSTaskListWClass")))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup);
+
+BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(ITaskBtnGroup* pTaskBtnGroup, TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
+{
+    if (groupType == TBG_LAUNCHER || groupType == TBG_GHOST)
+    {
+        return FALSE;
+    }
+    if (rowColBegin != 0 || rowColEnd <= rowColBegin)
+    {
+        return FALSE;
+    }
+    if (!Win10TaskbarHooks_HasMultiRowTaskList())
+    {
+        return FALSE;
+    }
+    if (Win10TaskbarHooks_IsLauncherGroupTaskButton(pTaskBtnGroup))
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
 // int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
 int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
     ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
@@ -4348,6 +4412,37 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     }
     ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
+    if (Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(pTaskBtnGroup, lastGroupType, rowColBegin, rowColEnd))
+    {
+        if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
+        {
+            __try
+            {
+                *pGroupType = lastGroupType;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+            bTypeModified = FALSE;
+        }
+        if (pcxShrinkable)
+        {
+            *pcxShrinkable = 0;
+        }
+        static LONG firstRowBlockLogCount = 0;
+        LONG currentFirstRowBlockLogCount = InterlockedIncrement(&firstRowBlockLogCount);
+        if (currentFirstRowBlockLogCount <= 64)
+        {
+            EPDebugLogWrite(
+                L"taskbtn first-row blocked type=%d begin=%d end=%d originalSpan=%d",
+                lastGroupType,
+                rowColBegin,
+                rowColEnd,
+                ret
+            );
+        }
+        ret = 0;
+    }
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
     {
         __try
@@ -4382,7 +4477,9 @@ BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup)
     HWND hWnd = NULL;
     BOOL isLauncherGroupWindow = FALSE;
 
-    if (!pTaskBtnGroup || !pTaskBtnGroup->lpVtbl || !pTaskBtnGroup->lpVtbl->GetTaskItem)
+    if (!pTaskBtnGroup
+        || !pTaskBtnGroup->lpVtbl
+        || !Win10TaskbarHooks_IsExecutablePointer(pTaskBtnGroup->lpVtbl->GetTaskItem))
     {
         return FALSE;
     }
@@ -4390,7 +4487,9 @@ BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup)
     __try
     {
         pTaskItem = pTaskBtnGroup->lpVtbl->GetTaskItem(pTaskBtnGroup, 0);
-        if (pTaskItem && pTaskItem->lpVtbl && pTaskItem->lpVtbl->GetWindow)
+        if (pTaskItem
+            && pTaskItem->lpVtbl
+            && Win10TaskbarHooks_IsExecutablePointer(pTaskItem->lpVtbl->GetWindow))
         {
             hWnd = pTaskItem->lpVtbl->GetWindow(pTaskItem);
             isLauncherGroupWindow = hWnd && IsWindow(hWnd) && LauncherGroups_IsLauncherGroupWindow(GetAncestor(hWnd, GA_ROOT));
@@ -4723,7 +4822,10 @@ void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
 
 void Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(ITaskBtnGroupVtbl* pVtbl)
 {
-    if (pVtbl && pVtbl->GetIdealSpan && pVtbl->GetIdealSpan != CTaskBtnGroup_GetIdealSpanHook && bRemoveExtraGapAroundPinnedItems)
+    if (pVtbl
+        && pVtbl->GetIdealSpan
+        && pVtbl->GetIdealSpan != CTaskBtnGroup_GetIdealSpanHook
+        && (bPinnedItemsActAsQuickLaunch || bRemoveExtraGapAroundPinnedItems))
     {
         DWORD flOldProtect = 0;
         if (VirtualProtect(pVtbl, sizeof(ITaskBtnGroupVtbl), PAGE_EXECUTE_READWRITE, &flOldProtect))
@@ -14971,8 +15073,7 @@ DWORD Inject(BOOL bIsExplorer)
         VnPatchIAT(hMyTaskbar, "uxtheme.dll", MAKEINTRESOURCEA(126), PeopleBand_DrawTextWithGlowHook);
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
-        Win10TaskbarHooks_PatchEPTaskbarLayout(hMyTaskbar);
-        EPDebugLogWrite(L"taskbar hooks installed pinnedQuickLaunch=%lu removeGap=%lu", bPinnedItemsActAsQuickLaunch, bRemoveExtraGapAroundPinnedItems);
+        EPDebugLogWrite(L"taskbar vtable hooks installed pinnedQuickLaunch=%lu removeGap=%lu", bPinnedItemsActAsQuickLaunch, bRemoveExtraGapAroundPinnedItems);
     }
 
     CreateThread(NULL, 0, LauncherGroupsThread, 0, 0, NULL);

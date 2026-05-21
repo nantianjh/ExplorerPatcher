@@ -14,12 +14,11 @@ on:
         required: false
 
 env:
-  PROJECT_FILE_PATH: ExplorerPatcher\ExplorerPatcher.vcxproj
+  SOLUTION_FILE_PATH: .
   BUILD_CONFIGURATION: Release
-  BUILD_PLATFORM: x64
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -33,41 +32,20 @@ jobs:
         env:
           GITHUB_EVENT_INPUTS_REF: ${{ github.event.inputs.ref }}
 
-      - name: Checkout latest build
+      - name: Checkout latest build and submodules
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref == ''
         with:
-          submodules: false
+          submodules: recursive
           persist-credentials: false
 
-      - name: Checkout specific build
+      - name: Checkout specific build and submodules
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref != ''
         with:
           ref: ${{ github.event.inputs.ref }}
-          submodules: false
+          submodules: recursive
           persist-credentials: false
-
-      - name: Initialize required submodules
-        shell: cmd
-        run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive libs/sws
-
-      - name: Verify libvalinet headers
-        shell: cmd
-        run: |
-          echo Cloning libvalinet headers directly.
-          rmdir /s /q "libs\libvalinet" 2>nul
-          git clone --depth 1 https://github.com/valinet/libvalinet "libs\libvalinet"
-          if not exist "libs\libvalinet\valinet\utility\osversion.h" (
-            echo Missing libs\libvalinet\valinet\utility\osversion.h
-            exit /b 1
-          )
-          if not exist "libs\libvalinet\valinet\universal\toast\toast.h" (
-            echo Missing libs\libvalinet\valinet\universal\toast\toast.h
-            exit /b 1
-          )
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
@@ -98,16 +76,125 @@ jobs:
         run: |
           nuget restore ExplorerPatcher.sln
 
+      - name: Build dependencies
+        shell: cmd
+        run: |
+          rmdir /s /q libs\zlib\build
+
+          if "%VSINSTALLDIR:~-1%"=="\" (
+              set "EP_VSINSTALLDIR=%VSINSTALLDIR:~0,-1%"
+          ) else (
+              set "EP_VSINSTALLDIR=%VSINSTALLDIR%"
+          )
+
+          cmake libs/zlib -Blibs/zlib/build/x64 -G "Visual Studio 18 2026" -A x64 -D"CMAKE_GENERATOR_INSTANCE:PATH=%EP_VSINSTALLDIR%" -D"CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>" -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+          cmake --build libs/zlib/build/x64 --config %BUILD_CONFIGURATION%
+
+      - name: Download ep_taskbar
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
+        with:
+          repository: ExplorerPatcher/ep_taskbar_releases
+          fileName: ep_taskbar.*.amd64.dll
+          latest: true
+          out-file-path: build/Release
+
+      # build/Release/ep_taskbar.*.amd64.dll -> build/Release/x64/ep_taskbar.*.dll
+      - name: Move ep_taskbar
+        shell: bash
+        run: |
+          if ls build/Release/ep_taskbar.*.amd64.dll 1> /dev/null 2>&1; then
+            mkdir -p build/Release/x64
+            for file in build/Release/ep_taskbar.*.amd64.dll; do
+              mv "$file" "build/Release/x64/$(basename "$file" .amd64.dll).dll"
+            done
+          fi
+
       - name: Build ExplorerPatcher (amd64)
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
-          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{env.BUILD_PLATFORM}} ${{env.PROJECT_FILE_PATH}}
+          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=amd64 ${{env.SOLUTION_FILE_PATH}}
+
+      - name: Generate dxgi.dll
+        shell: bash
+        run: |
+          if [[ -f "build/Release/x64/ExplorerPatcher.amd64.dll" ]]; then cp build/Release/x64/ExplorerPatcher.amd64.dll build/Release/x64/dxgi.dll; fi
+
+      - name: Patch amd64 setup
+        shell: cmd
+        run: |
+          if exist "build\Release\x64\ExplorerPatcher.amd64.dll" (
+            "build\Release\x64\ep_setup_patch.exe" "build\Release\x64\ExplorerPatcher.amd64.dll" "build\Release\x64\ep_setup.exe"
+          )
+          exit /b 0
+
+      - name: Delete intermediate files
+        shell: bash
+        run: |
+          rm -rf build/Release/x64/ep_setup_files
+          rm -f build/Release/x64/ep_setup_files.zip.bin
 
       - name: Upload artifacts
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ExplorerPatcher.amd64_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
+          name: ep_bin_x64_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
           path: |
-            build/Release/x64/ExplorerPatcher.amd64.dll
+            build/Release/x64/
           if-no-files-found: error
+
+      # build/Release/x64/ep_setup.exe -> build/Release/ep_setup.exe
+      - name: Stage files for release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          if [ -d "build/Release/x64" ] && ls build/Release/x64/ep_setup.exe 1> /dev/null 2>&1; then
+            cp build/Release/x64/ep_setup.exe build/Release/ep_setup.exe
+          fi
+
+      - name: Generate release name
+        shell: bash
+        working-directory: build/Release/x64
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          echo "data=$(./ep_generate_release_name.exe)" >> $GITHUB_OUTPUT
+        id: release_name
+
+      - name: Generate release notes
+        shell: bash
+        working-directory: build/Release/x64
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          echo "data<<EP_RELEASE_DESCRIPTION_DELIM" >> $GITHUB_OUTPUT
+          echo "$(./ep_generate_release_description.exe ${STEPS_VARS_OUTPUTS_SHA_SHORT} ${{ github.ref_type }} ${{ github.ref_name }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_OUTPUT
+          echo "EP_RELEASE_DESCRIPTION_DELIM" >> $GITHUB_OUTPUT
+        id: release_description
+        env:
+          STEPS_VARS_OUTPUTS_SHA_SHORT: ${{ steps.vars.outputs.sha_short }}
+
+      - name: Create/update release (valinet)
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        if: github.repository_owner == 'valinet' && github.event_name == 'push' && github.ref_type == 'tag'
+        id: create_release
+        with:
+          draft: false
+          prerelease: ${{ !startsWith(github.event.head_commit.message, 'rel_') }}
+          name: ${{ steps.release_name.outputs.data }}
+          tag_name: ${{ github.ref_name }}
+          body: ${{ steps.release_description.outputs.data }}
+          files: |
+            build/Release/ep_setup.exe
+          token: ${{ secrets.PAT }}
+
+      - name: Create/update release (forks)
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        if: github.repository_owner != 'valinet' && github.event_name == 'push' && github.ref_type == 'tag'
+        id: create_release_fork
+        with:
+          draft: false
+          prerelease: ${{ !startsWith(github.event.head_commit.message, 'rel_') }}
+          name: ${{ steps.release_name.outputs.data }}
+          tag_name: ${{ github.ref_name }}
+          body: ${{ steps.release_description.outputs.data }}
+          files: |
+            build/Release/ep_setup.exe
+          token: ${{ secrets.GITHUB_TOKEN }}

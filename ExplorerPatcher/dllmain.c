@@ -4348,13 +4348,21 @@ BOOL Win10TaskbarHooks_HasMultiRowTaskList()
 
 BOOL Win10TaskbarHooks_IsLauncherGroupTaskButton(ITaskBtnGroup* pTaskBtnGroup);
 
-BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(ITaskBtnGroup* pTaskBtnGroup, TBGROUPTYPE groupType, int rowColBegin, int rowColEnd)
+BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(ITaskBtnGroup* pTaskBtnGroup, TBGROUPTYPE groupType, int rowColBegin, int rowColEnd, int originalSpan)
 {
+    BOOL firstRowProbe;
+
     if (groupType == TBG_LAUNCHER || groupType == TBG_GHOST)
     {
         return FALSE;
     }
-    if (rowColBegin != 0 || rowColEnd <= rowColBegin)
+    if (originalSpan <= 0 || originalSpan > 32767)
+    {
+        return FALSE;
+    }
+
+    firstRowProbe = rowColBegin == 0 || rowColEnd < rowColBegin;
+    if (!firstRowProbe)
     {
         return FALSE;
     }
@@ -4387,6 +4395,9 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     TBGROUPTYPE* pGroupType = (TBGROUPTYPE*)(_this + 80 /*offsetof(CTaskBtnGroup, m_groupType)*/);
     TBGROUPTYPE lastGroupType = TBG_UNKNOWN;
     int ret;
+    BOOL shouldBlockFirstRow;
+    static LONG spanProbeLogCount = 0;
+    LONG currentSpanProbeLogCount;
 
     __try
     {
@@ -4412,7 +4423,22 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
     }
     ret = CTaskBtnGroup_GetIdealSpanFunc(
         pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
-    if (Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(pTaskBtnGroup, lastGroupType, rowColBegin, rowColEnd))
+    shouldBlockFirstRow = Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(pTaskBtnGroup, lastGroupType, rowColBegin, rowColEnd, ret);
+    currentSpanProbeLogCount = InterlockedIncrement(&spanProbeLogCount);
+    if (currentSpanProbeLogCount <= 128)
+    {
+        EPDebugLogWrite(
+            L"taskbtn span probe type=%d begin=%d end=%d ret=%d shrink=%d block=%d removeGap=%lu",
+            lastGroupType,
+            rowColBegin,
+            rowColEnd,
+            ret,
+            pcxShrinkable ? *pcxShrinkable : -1,
+            shouldBlockFirstRow,
+            bRemoveExtraGapAroundPinnedItems
+        );
+    }
+    if (shouldBlockFirstRow)
     {
         if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
         {

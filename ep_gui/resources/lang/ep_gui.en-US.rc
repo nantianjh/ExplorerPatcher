@@ -407,6 +407,11 @@ BEGIN
     IDS_ADV_SYMBOLS             "Enable symbols download"
     IDS_ADV_PINNEDITEMS         "Pinned items act as quick launch (don't group with active apps)"
     IDS_ADV_REMOVEEXTRAGAP      "When the taskbar shows button labels, remove the extra gap around pinned items"
+    IDS_ADV_LAUNCHERGROUPVIEW   "Launcher group app view"
+    IDS_ADV_LAUNCHERGROUPVIEW_0 "List (default)"
+    IDS_ADV_LAUNCHERGROUPVIEW_1 "Large icons"
+    IDS_ADV_LAUNCHERGROUPVIEW_2 "Medium icons"
+    IDS_ADV_LAUNCHERGROUPVIEW_3 "Small icons"
     IDS_ADV_XAMLSOUNDS          "Enable UI sounds in Explorer's XAML views"
 
     IDS_ABOUT                   "About"

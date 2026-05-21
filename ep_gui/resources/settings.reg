@@ -757,6 +757,12 @@
 ;b %R:1913% *
 "RemoveExtraGapAroundPinnedItems"=dword:00000000
 ;g Advanced_Windows10
+;z 4 %R:1914%
+;x 0 %R:1915%
+;x 1 %R:1916%
+;x 2 %R:1917%
+;x 3 %R:1918%
+"LauncherGroupsViewMode"=dword:00000000
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\ExplorerPatcher]
 ;b %R:1927% *
 "XamlSounds"=dword:00000000

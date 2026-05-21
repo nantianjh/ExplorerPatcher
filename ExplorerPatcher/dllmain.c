@@ -902,7 +902,12 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MAX_ITEMS 16
 #define EP_LAUNCHER_GROUP_CLASS_NAME L"EP_LauncherGroupWindow_" _T(EP_CLSID)
 #define EP_LAUNCHER_GROUP_SHOW_MENU_MSG (WM_APP + 0x512)
+#define EP_LAUNCHER_GROUP_RELOAD_MSG (WM_APP + 0x513)
 #define EP_LAUNCHER_GROUP_MENU_BASE 1000
+#define EP_LAUNCHER_GROUP_MENU_RENAME 2101
+#define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
+#define EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY 2103
+#define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
 
 typedef struct _LauncherGroupItem
 {
@@ -927,6 +932,7 @@ typedef struct _LauncherGroup
 } LauncherGroup;
 
 LauncherGroup* g_launcherGroups = NULL;
+DWORD g_launcherGroupsThreadId = 0;
 
 void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
 {
@@ -1127,15 +1133,32 @@ HICON LauncherGroups_CreateCompositeIcon(LauncherGroup* group, int size)
     return hIcon ? hIcon : CopyIcon(group->items[0].hIconLarge ? group->items[0].hIconLarge : LoadIconW(NULL, IDI_APPLICATION));
 }
 
+LauncherGroup* LauncherGroups_FindByKey(LPCWSTR keyName)
+{
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        if (!_wcsicmp(group->szKeyName, keyName))
+        {
+            return group;
+        }
+    }
+    return NULL;
+}
+
 BOOL LauncherGroups_LoadFromRegistry()
 {
     HKEY hRoot = NULL;
     DWORD index = 0;
-    LauncherGroup* tail = NULL;
+    LauncherGroup* tail = g_launcherGroups;
+
+    while (tail && tail->next)
+    {
+        tail = tail->next;
+    }
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
     {
-        return FALSE;
+        return g_launcherGroups != NULL;
     }
 
     while (TRUE)
@@ -1150,6 +1173,10 @@ BOOL LauncherGroups_LoadFromRegistry()
         if (RegEnumKeyExW(hRoot, index++, szSubKey, &cchSubKey, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
         {
             break;
+        }
+        if (LauncherGroups_FindByKey(szSubKey))
+        {
+            continue;
         }
 
         if (RegOpenKeyExW(hRoot, szSubKey, 0, KEY_READ, &hGroupKey) != ERROR_SUCCESS)
@@ -1193,12 +1220,6 @@ BOOL LauncherGroups_LoadFromRegistry()
         }
 
         RegCloseKey(hGroupKey);
-        if (!group->cItems)
-        {
-            free(group);
-            continue;
-        }
-
         group->hIconSmall = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXSMICON));
         group->hIconLarge = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXICON));
 
@@ -1217,11 +1238,199 @@ BOOL LauncherGroups_LoadFromRegistry()
     return g_launcherGroups != NULL;
 }
 
+void LauncherGroups_PostReload()
+{
+    if (g_launcherGroupsThreadId)
+    {
+        PostThreadMessageW(g_launcherGroupsThreadId, EP_LAUNCHER_GROUP_RELOAD_MSG, 0, 0);
+    }
+}
+
+BOOL LauncherGroups_CreateRegistryGroup(LPCWSTR name)
+{
+    HKEY hRoot = NULL;
+    HKEY hGroup = NULL;
+    WCHAR keyName[64];
+    DWORD index = GetTickCount();
+    BOOL ok = FALSE;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, NULL, 0, KEY_WRITE, NULL, &hRoot, NULL) != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    for (DWORD i = 0; i < 1000; i++)
+    {
+        DWORD disposition = 0;
+        swprintf_s(keyName, ARRAYSIZE(keyName), L"Group%08X", index + i);
+        if (RegCreateKeyExW(hRoot, keyName, 0, NULL, 0, KEY_WRITE, NULL, &hGroup, &disposition) == ERROR_SUCCESS)
+        {
+            if (disposition == REG_CREATED_NEW_KEY)
+            {
+                RegSetValueExW(hGroup, L"Name", 0, REG_SZ, (const BYTE*)name, ((DWORD)wcslen(name) + 1) * sizeof(WCHAR));
+                ok = TRUE;
+                break;
+            }
+            RegCloseKey(hGroup);
+            hGroup = NULL;
+        }
+    }
+
+    if (hGroup)
+    {
+        RegCloseKey(hGroup);
+    }
+    RegCloseKey(hRoot);
+    LauncherGroups_PostReload();
+    EPDebugLogWrite(L"launcher-group registry create name=\"%s\" ok=%d", name, ok);
+    return ok;
+}
+
+BOOL LauncherGroups_CreateRegistryGroupPrompt(HWND hWnd)
+{
+    WCHAR defaultName[64];
+    WCHAR name[128];
+    BOOL cancelled = FALSE;
+
+    swprintf_s(defaultName, ARRAYSIZE(defaultName), L"分组%lu", GetTickCount() % 10000);
+    LauncherGroups_CopyString(name, ARRAYSIZE(name), defaultName);
+    if (FAILED(InputBox(FALSE, hWnd, L"输入分组名称", L"新建图标分组", defaultName, name, ARRAYSIZE(name), &cancelled)) || cancelled || !name[0])
+    {
+        return FALSE;
+    }
+
+    return LauncherGroups_CreateRegistryGroup(name);
+}
+
+BOOL LauncherGroups_RenameRegistryGroup(LauncherGroup* group)
+{
+    WCHAR newName[128];
+    WCHAR oldName[128];
+    BOOL cancelled = FALSE;
+    HKEY hKey = NULL;
+    BOOL ok = FALSE;
+
+    if (!group)
+    {
+        return FALSE;
+    }
+
+    LauncherGroups_CopyString(newName, ARRAYSIZE(newName), group->szName);
+    LauncherGroups_CopyString(oldName, ARRAYSIZE(oldName), group->szName);
+    if (FAILED(InputBox(FALSE, group->hWnd, L"输入分组名称", L"修改分组名", group->szName, newName, ARRAYSIZE(newName), &cancelled)) || cancelled || !newName[0])
+    {
+        return FALSE;
+    }
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS)
+    {
+        HKEY hGroupKey = NULL;
+        if (RegOpenKeyExW(hKey, group->szKeyName, 0, KEY_WRITE, &hGroupKey) == ERROR_SUCCESS)
+        {
+            ok = RegSetValueExW(hGroupKey, L"Name", 0, REG_SZ, (const BYTE*)newName, ((DWORD)wcslen(newName) + 1) * sizeof(WCHAR)) == ERROR_SUCCESS;
+            RegCloseKey(hGroupKey);
+        }
+        RegCloseKey(hKey);
+    }
+
+    if (ok)
+    {
+        LauncherGroups_CopyString(group->szName, ARRAYSIZE(group->szName), newName);
+        if (group->hWnd)
+        {
+            SetWindowTextW(group->hWnd, group->szName);
+        }
+    }
+    LauncherGroups_PostReload();
+    EPDebugLogWrite(L"launcher-group rename old=\"%s\" new=\"%s\" ok=%d", oldName, newName, ok);
+    return ok;
+}
+
+BOOL LauncherGroups_AddWindowToGroup(LauncherGroup* group, HWND hSourceWnd)
+{
+    DWORD processId = 0;
+    HANDLE hProcess = NULL;
+    WCHAR path[MAX_PATH];
+    WCHAR itemValue[1024];
+    WCHAR valueName[32];
+    HKEY hKey = NULL;
+    HKEY hGroupKey = NULL;
+    BOOL ok = FALSE;
+
+    if (!group || group->cItems >= EP_LAUNCHER_GROUP_MAX_ITEMS)
+    {
+        return FALSE;
+    }
+
+    if (!hSourceWnd || hSourceWnd == group->hWnd)
+    {
+        hSourceWnd = GetLastActivePopup(GetShellWindow());
+    }
+
+    GetWindowThreadProcessId(hSourceWnd, &processId);
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!hProcess)
+    {
+        return FALSE;
+    }
+
+    DWORD cchPath = ARRAYSIZE(path);
+    path[0] = L'\0';
+    if (!QueryFullProcessImageNameW(hProcess, 0, path, &cchPath))
+    {
+        CloseHandle(hProcess);
+        return FALSE;
+    }
+    CloseHandle(hProcess);
+
+    LPCWSTR fileName = PathFindFileNameW(path);
+    swprintf_s(itemValue, ARRAYSIZE(itemValue), L"%s|%s|", fileName && *fileName ? fileName : path, path);
+    swprintf_s(valueName, ARRAYSIZE(valueName), L"Item%lu", group->cItems);
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS)
+    {
+        if (RegOpenKeyExW(hKey, group->szKeyName, 0, KEY_WRITE, &hGroupKey) == ERROR_SUCCESS)
+        {
+            ok = RegSetValueExW(hGroupKey, valueName, 0, REG_SZ, (const BYTE*)itemValue, ((DWORD)wcslen(itemValue) + 1) * sizeof(WCHAR)) == ERROR_SUCCESS;
+            RegCloseKey(hGroupKey);
+        }
+        RegCloseKey(hKey);
+    }
+
+    if (ok)
+    {
+        LauncherGroupItem* item = &group->items[group->cItems];
+        LauncherGroups_ParseItemValue(itemValue, item);
+        item->hIconSmall = LauncherGroups_LoadIconForPath(item->szPath, FALSE);
+        item->hIconLarge = LauncherGroups_LoadIconForPath(item->szPath, TRUE);
+        group->cItems++;
+        if (group->hIconSmall)
+        {
+            DestroyIcon(group->hIconSmall);
+        }
+        if (group->hIconLarge)
+        {
+            DestroyIcon(group->hIconLarge);
+        }
+        group->hIconSmall = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXSMICON));
+        group->hIconLarge = LauncherGroups_CreateCompositeIcon(group, GetSystemMetrics(SM_CXICON));
+        if (group->hWnd)
+        {
+            SendMessageW(group->hWnd, WM_SETICON, ICON_SMALL, (LPARAM)group->hIconSmall);
+            SendMessageW(group->hWnd, WM_SETICON, ICON_BIG, (LPARAM)group->hIconLarge);
+        }
+    }
+    LauncherGroups_PostReload();
+    EPDebugLogWrite(L"launcher-group add-window group=\"%s\" hwnd=%p value=\"%s\" ok=%d", group->szName, hSourceWnd, itemValue, ok);
+    return ok;
+}
+
 void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
 {
     HMENU hMenu;
     POINT pt;
     int cmd;
+    HWND hSourceWnd;
 
     if (!group || group->bMenuActive)
     {
@@ -1241,10 +1450,18 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
     {
         AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_BASE + i, group->items[i].szName);
     }
+    if (group->cItems)
+    {
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND, L"添加当前窗口");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_RENAME, L"修改分组名");
+    AppendMenuW(hMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY, L"打开分组配置");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_GRAYED, 0, EP_LAUNCHER_GROUPS_REGPATH);
 
     GetCursorPos(&pt);
+    hSourceWnd = GetForegroundWindow();
     SetForegroundWindow(hWnd);
     cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
     DestroyMenu(hMenu);
@@ -1254,6 +1471,18 @@ void LauncherGroups_ShowMenu(HWND hWnd, LauncherGroup* group)
         LauncherGroupItem* item = &group->items[cmd - EP_LAUNCHER_GROUP_MENU_BASE];
         EPDebugLogWrite(L"launcher-group launch group=\"%s\" item=\"%s\" path=\"%s\"", group->szName, item->szName, item->szPath);
         ShellExecuteW(NULL, L"open", item->szPath, item->szArgs[0] ? item->szArgs : NULL, NULL, SW_SHOWNORMAL);
+    }
+    else if (cmd == EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND)
+    {
+        LauncherGroups_AddWindowToGroup(group, hSourceWnd);
+    }
+    else if (cmd == EP_LAUNCHER_GROUP_MENU_RENAME)
+    {
+        LauncherGroups_RenameRegistryGroup(group);
+    }
+    else if (cmd == EP_LAUNCHER_GROUP_MENU_OPEN_REGISTRY)
+    {
+        ShellExecuteW(NULL, L"open", L"regedit.exe", L"/m", NULL, SW_SHOWNORMAL);
     }
 
     ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
@@ -1288,6 +1517,9 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             return 0;
         }
         break;
+    case WM_CONTEXTMENU:
+        PostMessageW(hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+        return 0;
     case WM_CLOSE:
         ShowWindow(hWnd, SW_SHOWMINNOACTIVE);
         return 0;
@@ -1302,27 +1534,15 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
 
-DWORD LauncherGroupsThread(DWORD unused)
+void LauncherGroups_CreateWindowsForLoadedGroups()
 {
-    WNDCLASSW wc;
-    LauncherGroup* group;
-
-    if (!LauncherGroups_LoadFromRegistry())
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
     {
-        EPDebugLogWrite(L"launcher-groups none");
-        return 0;
-    }
-    EPDebugLogWrite(L"launcher-groups thread start");
+        if (group->hWnd)
+        {
+            continue;
+        }
 
-    ZeroMemory(&wc, sizeof(wc));
-    wc.lpfnWndProc = LauncherGroups_WndProc;
-    wc.hInstance = GetModuleHandleW(NULL);
-    wc.lpszClassName = EP_LAUNCHER_GROUP_CLASS_NAME;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    RegisterClassW(&wc);
-
-    for (group = g_launcherGroups; group; group = group->next)
-    {
         group->hWnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             EP_LAUNCHER_GROUP_CLASS_NAME,
@@ -1345,10 +1565,40 @@ DWORD LauncherGroupsThread(DWORD unused)
             EPDebugLogWrite(L"launcher-group window shown hwnd=%p group=\"%s\"", group->hWnd, group->szName);
         }
     }
+}
+
+DWORD LauncherGroupsThread(DWORD unused)
+{
+    WNDCLASSW wc;
+    MSG dummyMsg;
+    PeekMessageW(&dummyMsg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    g_launcherGroupsThreadId = GetCurrentThreadId();
+
+    if (!LauncherGroups_LoadFromRegistry())
+    {
+        EPDebugLogWrite(L"launcher-groups none");
+    }
+    EPDebugLogWrite(L"launcher-groups thread start");
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = LauncherGroups_WndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.lpszClassName = EP_LAUNCHER_GROUP_CLASS_NAME;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    LauncherGroups_CreateWindowsForLoadedGroups();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
+        if (msg.message == EP_LAUNCHER_GROUP_RELOAD_MSG)
+        {
+            EPDebugLogWrite(L"launcher-groups reload");
+            LauncherGroups_LoadFromRegistry();
+            LauncherGroups_CreateWindowsForLoadedGroups();
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -3191,6 +3441,42 @@ BOOL CheckIfMenuContainsOwnPropertiesItem(HMENU hMenu)
     return FALSE;
 }
 
+void LauncherGroups_AddTaskbarMenuItem(HMENU hMenu)
+{
+#if WITH_MAIN_PATCHER
+    if (!hMenu)
+    {
+        return;
+    }
+    if (GetMenuState(hMenu, EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE, MF_BYCOMMAND) != 0xFFFFFFFF)
+    {
+        return;
+    }
+
+    MENUITEMINFOW menuInfo;
+    ZeroMemory(&menuInfo, sizeof(menuInfo));
+    menuInfo.cbSize = sizeof(menuInfo);
+    menuInfo.fMask = MIIM_ID | MIIM_STRING | MIIM_STATE;
+    menuInfo.wID = EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE;
+    menuInfo.dwTypeData = L"新建图标分组";
+    menuInfo.cch = (UINT)wcslen(menuInfo.dwTypeData);
+    menuInfo.fState = MFS_ENABLED;
+
+    int count = GetMenuItemCount(hMenu);
+    int insertAt = count > 0 ? count - 1 : 0;
+    InsertMenuItemW(hMenu, insertAt, TRUE, &menuInfo);
+    InsertMenuW(hMenu, insertAt + 1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    EPDebugLogWrite(L"launcher-group taskbar menu item added menu=%p", hMenu);
+#endif
+}
+
+BOOL LauncherGroups_IsTaskbarMenuOwner(LPCWSTR className)
+{
+    return !wcscmp(className, L"Shell_TrayWnd")
+        || !wcscmp(className, L"Shell_SecondaryTrayWnd")
+        || !wcscmp(className, L"MSTaskListWClass");
+}
+
 #if WITH_MAIN_PATCHER
 #define DEFINE_IMMERSIVE_MENU_HOOK(name) \
     static ImmersiveContextMenuHelper_ApplyOwnerDrawToMenu_t name##_ApplyOwnerDrawToMenuFunc = NULL; \
@@ -3327,9 +3613,10 @@ BOOL TrackPopupMenuHookEx(
     //wprintf(L">> %s %d %d\n", wszClassName, bIsTaskbar, bIsExplorerProcess);
 
     BOOL bContainsOwn = FALSE;
-    if (bIsExplorerProcess && (!wcscmp(wszClassName, L"Shell_TrayWnd") || !wcscmp(wszClassName, L"Shell_SecondaryTrayWnd")))
+    if (bIsExplorerProcess && LauncherGroups_IsTaskbarMenuOwner(wszClassName))
     {
         bContainsOwn = CheckIfMenuContainsOwnPropertiesItem(hMenu);
+        LauncherGroups_AddTaskbarMenuItem(hMenu);
     }
 
     if (bIsTaskbar && (bIsExplorerProcess ? 1 : (!wcscmp(wszClassName, L"SHELLDLL_DefView") || !wcscmp(wszClassName, L"SysTreeView32"))))
@@ -3373,6 +3660,11 @@ BOOL TrackPopupMenuHookEx(
                 LaunchPropertiesGUI(hModule);
                 return FALSE;
             }
+            if (bRet == EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE)
+            {
+                LauncherGroups_CreateRegistryGroupPrompt(hWnd);
+                return FALSE;
+            }
 #endif
             return bRet;
         }
@@ -3391,6 +3683,11 @@ BOOL TrackPopupMenuHookEx(
     if (bContainsOwn && (b >= 12000 && b <= 12200))
     {
         LaunchPropertiesGUI(hModule);
+        return FALSE;
+    }
+    if (b == EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE)
+    {
+        LauncherGroups_CreateRegistryGroupPrompt(hWnd);
         return FALSE;
     }
 #endif
@@ -3425,9 +3722,10 @@ BOOL TrackPopupMenuHook(
     //wprintf(L">> %s %d %d\n", wszClassName, bIsTaskbar, bIsExplorerProcess);
 
     BOOL bContainsOwn = FALSE;
-    if (bIsExplorerProcess && (!wcscmp(wszClassName, L"Shell_TrayWnd") || !wcscmp(wszClassName, L"Shell_SecondaryTrayWnd")))
+    if (bIsExplorerProcess && LauncherGroups_IsTaskbarMenuOwner(wszClassName))
     {
         bContainsOwn = CheckIfMenuContainsOwnPropertiesItem(hMenu);
+        LauncherGroups_AddTaskbarMenuItem(hMenu);
     }
 
     if (bIsTaskbar && (bIsExplorerProcess ? 1 : (!wcscmp(wszClassName, L"SHELLDLL_DefView") || !wcscmp(wszClassName, L"SysTreeView32"))))
@@ -3473,6 +3771,11 @@ BOOL TrackPopupMenuHook(
                 LaunchPropertiesGUI(hModule);
                 return FALSE;
             }
+            if (bRet == EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE)
+            {
+                LauncherGroups_CreateRegistryGroupPrompt(hWnd);
+                return FALSE;
+            }
 #endif
             return bRet;
         }
@@ -3492,6 +3795,11 @@ BOOL TrackPopupMenuHook(
     if (bContainsOwn && (b >= 12000 && b <= 12200))
     {
         LaunchPropertiesGUI(hModule);
+        return FALSE;
+    }
+    if (b == EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE)
+    {
+        LauncherGroups_CreateRegistryGroupPrompt(hWnd);
         return FALSE;
     }
 #endif

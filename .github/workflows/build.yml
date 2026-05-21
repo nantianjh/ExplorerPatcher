@@ -7,18 +7,10 @@
 name: Build
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
     inputs:
       ref:
         description: 'Commit'
-        required: false
-      config:
-        description: 'Configuration'
-        required: false
-      build_dir:
-        description: 'Build dir'
         required: false
 
 env:
@@ -37,12 +29,8 @@ jobs:
         shell: bash
         run: |
           echo "ref: ${GITHUB_EVENT_INPUTS_REF}"
-          echo "config: ${GITHUB_EVENT_INPUTS_CONFIG}"
-          echo "build_dir: ${GITHUB_EVENT_INPUTS_BUILD_DIR}"
         env:
           GITHUB_EVENT_INPUTS_REF: ${{ github.event.inputs.ref }}
-          GITHUB_EVENT_INPUTS_CONFIG: ${{ github.event.inputs.config }}
-          GITHUB_EVENT_INPUTS_BUILD_DIR: ${{ github.event.inputs.build_dir }}
 
       - name: Checkout latest build and submodules
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -91,18 +79,26 @@ jobs:
       - name: Build dependencies
         shell: cmd
         run: |
-          BuildDependencies%BUILD_CONFIGURATION%.bat
+          rmdir /s /q libs\zlib\build
+
+          if "%VSINSTALLDIR:~-1%"=="\" (
+              set "EP_VSINSTALLDIR=%VSINSTALLDIR:~0,-1%"
+          ) else (
+              set "EP_VSINSTALLDIR=%VSINSTALLDIR%"
+          )
+
+          cmake libs/zlib -Blibs/zlib/build/x64 -G "Visual Studio 18 2026" -A x64 -D"CMAKE_GENERATOR_INSTANCE:PATH=%EP_VSINSTALLDIR%" -D"CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>" -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+          cmake --build libs/zlib/build/x64 --config %BUILD_CONFIGURATION%
 
       - name: Download ep_taskbar
         uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
         with:
           repository: ExplorerPatcher/ep_taskbar_releases
-          fileName: ep_taskbar.*.dll
+          fileName: ep_taskbar.*.amd64.dll
           latest: true
           out-file-path: build/Release
 
       # build/Release/ep_taskbar.*.amd64.dll -> build/Release/x64/ep_taskbar.*.dll
-      # build/Release/ep_taskbar.*.arm64.dll -> build/Release/ARM64/ep_taskbar.*.dll
       - name: Move ep_taskbar
         shell: bash
         run: |
@@ -113,53 +109,15 @@ jobs:
             done
           fi
 
-          if ls build/Release/ep_taskbar.*.arm64.dll 1> /dev/null 2>&1; then
-            mkdir -p build/Release/ARM64
-            for file in build/Release/ep_taskbar.*.arm64.dll; do
-              mv "$file" "build/Release/ARM64/$(basename "$file" .arm64.dll).dll"
-            done
-          fi
-
-      - name: Build ExplorerPatcher (IA-32)
-        if: github.event.inputs.config == ''
-        working-directory: ${{env.GITHUB_WORKSPACE}}
-        run: |
-          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=IA-32 ${{env.SOLUTION_FILE_PATH}}
-
       - name: Build ExplorerPatcher (amd64)
-        if: github.event.inputs.config == ''
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
           msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=amd64 ${{env.SOLUTION_FILE_PATH}}
-
-      - name: Build ExplorerPatcher (arm64)
-        if: github.event.inputs.config == ''
-        working-directory: ${{env.GITHUB_WORKSPACE}}
-        run: |
-          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=arm64 /p:WithArm64XBinaries=true ${{env.SOLUTION_FILE_PATH}}
-
-      - name: Build ExplorerPatcher (Custom Build)
-        if: github.event.inputs.config != ''
-        working-directory: ${{env.GITHUB_WORKSPACE}}
-        run: |
-          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=$env:GITHUB_EVENT_INPUTS_CONFIG ${{env.SOLUTION_FILE_PATH}}
-        env:
-          GITHUB_EVENT_INPUTS_CONFIG: ${{ github.event.inputs.config }}
-
-      - name: Create expected build directory
-        if: github.event.inputs.build_dir != ''
-        shell: bash
-        run: |
-          mkdir build
-          cp -r ${GITHUB_EVENT_INPUTS_BUILD_DIR}/Release build/Release
-        env:
-          GITHUB_EVENT_INPUTS_BUILD_DIR: ${{ github.event.inputs.build_dir }}
 
       - name: Generate dxgi.dll
         shell: bash
         run: |
           if [[ -f "build/Release/x64/ExplorerPatcher.amd64.dll" ]]; then cp build/Release/x64/ExplorerPatcher.amd64.dll build/Release/x64/dxgi.dll; fi
-          if [[ -f "build/Release/ARM64/ExplorerPatcher.arm64.dll" ]]; then cp build/Release/ARM64/ExplorerPatcher.arm64.dll build/Release/ARM64/dxgi.dll; fi
 
       - name: Patch amd64 setup
         shell: cmd
@@ -169,42 +127,28 @@ jobs:
           )
           exit /b 0
 
-      - name: Patch arm64 setup
-        shell: cmd
-        run: |
-          if exist "build\Release\ARM64\ExplorerPatcher.arm64.dll" (
-            "build\Release\x64\ep_setup_patch.exe" "build\Release\ARM64\ExplorerPatcher.arm64.dll" "build\Release\ARM64\ep_setup.exe"
-          )
-          exit /b 0
-
       - name: Delete intermediate files
         shell: bash
         run: |
           rm -rf build/Release/x64/ep_setup_files
           rm -f build/Release/x64/ep_setup_files.zip.bin
-          rm -rf build/Release/ARM64/ep_setup_files
-          rm -f build/Release/ARM64/ep_setup_files.zip.bin
 
       - name: Upload artifacts
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ep_bin_multi_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
+          name: ep_bin_x64_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
           path: |
-            build/Release/
+            build/Release/x64/
           if-no-files-found: error
 
       # build/Release/x64/ep_setup.exe -> build/Release/ep_setup.exe
-      # build/Release/ARM64/ep_setup.exe -> build/Release/ep_setup_arm64.exe
       - name: Stage files for release
         if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         run: |
           if [ -d "build/Release/x64" ] && ls build/Release/x64/ep_setup.exe 1> /dev/null 2>&1; then
             cp build/Release/x64/ep_setup.exe build/Release/ep_setup.exe
-          fi
-          if [ -d "build/Release/ARM64" ] && ls build/Release/ARM64/ep_setup.exe 1> /dev/null 2>&1; then
-            cp build/Release/ARM64/ep_setup.exe build/Release/ep_setup_arm64.exe
           fi
 
       - name: Generate release name
@@ -239,7 +183,6 @@ jobs:
           body: ${{ steps.release_description.outputs.data }}
           files: |
             build/Release/ep_setup.exe
-            build/Release/ep_setup_arm64.exe
           token: ${{ secrets.PAT }}
 
       - name: Create/update release (forks)
@@ -254,5 +197,4 @@ jobs:
           body: ${{ steps.release_description.outputs.data }}
           files: |
             build/Release/ep_setup.exe
-            build/Release/ep_setup_arm64.exe
           token: ${{ secrets.GITHUB_TOKEN }}

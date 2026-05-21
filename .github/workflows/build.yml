@@ -33,19 +33,19 @@ jobs:
         env:
           GITHUB_EVENT_INPUTS_REF: ${{ github.event.inputs.ref }}
 
-      - name: Checkout latest build and submodules
+      - name: Checkout latest build
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref == ''
         with:
-          submodules: recursive
+          submodules: false
           persist-credentials: false
 
-      - name: Checkout specific build and submodules
+      - name: Checkout specific build
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref != ''
         with:
           ref: ${{ github.event.inputs.ref }}
-          submodules: recursive
+          submodules: false
           persist-credentials: false
 
       - name: Initialize required submodules
@@ -53,19 +53,13 @@ jobs:
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive libs/sws
-          git submodule update --init --recursive libs/libvalinet || exit /b 0
 
       - name: Verify libvalinet headers
         shell: cmd
         run: |
-          if not exist "libs\libvalinet\valinet\utility\osversion.h" goto clone_libvalinet
-          if not exist "libs\libvalinet\valinet\universal\toast\toast.h" goto clone_libvalinet
-          goto verify_libvalinet
-          :clone_libvalinet
-            echo libvalinet headers are missing; cloning libvalinet directly.
-            rmdir /s /q "libs\libvalinet" 2>nul
-            git clone --depth 1 https://github.com/valinet/libvalinet "libs\libvalinet"
-          :verify_libvalinet
+          echo Cloning libvalinet headers directly.
+          rmdir /s /q "libs\libvalinet" 2>nul
+          git clone --depth 1 https://github.com/valinet/libvalinet "libs\libvalinet"
           if not exist "libs\libvalinet\valinet\utility\osversion.h" (
             echo Missing libs\libvalinet\valinet\utility\osversion.h
             exit /b 1

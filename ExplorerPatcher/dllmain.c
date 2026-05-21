@@ -4361,7 +4361,7 @@ BOOL Win10TaskbarHooks_ShouldKeepTaskGroupOffFirstRow(ITaskBtnGroup* pTaskBtnGro
         return FALSE;
     }
 
-    firstRowProbe = rowColBegin == 0 || rowColEnd < rowColBegin;
+    firstRowProbe = rowColBegin == 0 || (rowColBegin <= 0 && rowColEnd < rowColBegin);
     if (!firstRowProbe)
     {
         return FALSE;

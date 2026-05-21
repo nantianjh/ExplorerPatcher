@@ -48,6 +48,33 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Initialize required submodules
+        shell: cmd
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive libs/sws
+          git submodule update --init --recursive libs/libvalinet || exit /b 0
+
+      - name: Verify libvalinet headers
+        shell: cmd
+        run: |
+          if not exist "libs\libvalinet\valinet\utility\osversion.h" goto clone_libvalinet
+          if not exist "libs\libvalinet\valinet\universal\toast\toast.h" goto clone_libvalinet
+          goto verify_libvalinet
+          :clone_libvalinet
+            echo libvalinet headers are missing; cloning libvalinet directly.
+            rmdir /s /q "libs\libvalinet" 2>nul
+            git clone --depth 1 https://github.com/valinet/libvalinet "libs\libvalinet"
+          :verify_libvalinet
+          if not exist "libs\libvalinet\valinet\utility\osversion.h" (
+            echo Missing libs\libvalinet\valinet\utility\osversion.h
+            exit /b 1
+          )
+          if not exist "libs\libvalinet\valinet\universal\toast\toast.h" (
+            echo Missing libs\libvalinet\valinet\universal\toast\toast.h
+            exit /b 1
+          )
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
 

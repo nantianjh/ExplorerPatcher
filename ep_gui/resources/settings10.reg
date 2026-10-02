@@ -589,6 +589,7 @@
 ;x 2 %R:1917%
 ;x 3 %R:1918%
 "LauncherGroupsViewMode"=dword:00000000
+"LauncherGroupsColumnsPerRow"=dword:00000003
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\ExplorerPatcher]
 ;b %R:1927% *
 "XamlSounds"=dword:00000000

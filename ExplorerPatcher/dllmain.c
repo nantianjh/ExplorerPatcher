@@ -923,7 +923,8 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #pragma region "Launcher groups"
 #if WITH_MAIN_PATCHER
 #define EP_LAUNCHER_GROUPS_REGPATH TEXT(REGPATH) TEXT("\\LauncherGroups")
-#define EP_LAUNCHER_GROUP_MAX_ITEMS 16
+#define EP_LAUNCHER_GROUP_MAX_ITEMS 1024
+#define EP_LAUNCHER_GROUP_INITIAL_ITEMS 16
 #define EP_LAUNCHER_GROUP_CLASS_NAME L"EP_LauncherGroupWindow_" _T(EP_CLSID)
 #define EP_LAUNCHER_GROUP_SHOW_MENU_MSG (WM_APP + 0x512)
 #define EP_LAUNCHER_GROUP_RELOAD_MSG (WM_APP + 0x513)
@@ -939,6 +940,11 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_VIEW_MEDIUM (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_MEDIUM_ICONS)
 #define EP_LAUNCHER_GROUP_MENU_VIEW_SMALL (EP_LAUNCHER_GROUP_MENU_VIEW_FIRST + LAUNCHER_GROUP_VIEW_SMALL_ICONS)
 #define EP_LAUNCHER_GROUP_MENU_VIEW_LAST EP_LAUNCHER_GROUP_MENU_VIEW_SMALL
+#define EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST 2140
+#define EP_LAUNCHER_GROUP_MENU_ARRANGE_3 EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST
+#define EP_LAUNCHER_GROUP_MENU_ARRANGE_4 (EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST + 1)
+#define EP_LAUNCHER_GROUP_MENU_ARRANGE_5 (EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST + 2)
+#define EP_LAUNCHER_GROUP_MENU_ARRANGE_CUSTOM (EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST + 3)
 #define EP_LAUNCHER_GROUP_MENU_REMOVE_FIRST 2200
 #define EP_LAUNCHER_GROUP_MENU_REMOVE_LAST (EP_LAUNCHER_GROUP_MENU_REMOVE_FIRST + EP_LAUNCHER_GROUP_MAX_ITEMS - 1)
 #define EP_LAUNCHER_GROUP_TASKBAR_MENU_CREATE 12551
@@ -946,6 +952,10 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_MODE_NONE 0
 #define EP_LAUNCHER_GROUP_MENU_MODE_SETTINGS 1
 #define EP_LAUNCHER_GROUP_VIEWMODE_VALUE L"LauncherGroupsViewMode"
+#define EP_LAUNCHER_GROUP_COLUMNS_VALUE L"LauncherGroupsColumnsPerRow"
+#define EP_LAUNCHER_GROUP_COLUMNS_DEFAULT 3
+#define EP_LAUNCHER_GROUP_COLUMNS_MIN 1
+#define EP_LAUNCHER_GROUP_COLUMNS_MAX 64
 
 typedef enum _LauncherGroupsViewMode
 {
@@ -968,8 +978,9 @@ typedef struct _LauncherGroup
 {
     WCHAR szKeyName[128];
     WCHAR szName[128];
-    LauncherGroupItem items[EP_LAUNCHER_GROUP_MAX_ITEMS];
+    LauncherGroupItem* items;
     DWORD cItems;
+    DWORD cItemsAlloc;
     HWND hWnd;
     HWND hListView;
     HIMAGELIST hImageListSmall;
@@ -1013,6 +1024,7 @@ LauncherGroup* g_launcherGroupsLastHoverGroup = NULL;
 DWORD g_launcherGroupsLastHoverTick = 0;
 DWORD g_launcherGroupsLastMouseCheckTick = 0;
 DWORD g_launcherGroupsViewMode = LAUNCHER_GROUP_VIEW_LIST;
+DWORD g_launcherGroupsColumnsPerRow = EP_LAUNCHER_GROUP_COLUMNS_DEFAULT;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -1021,6 +1033,76 @@ void LauncherGroups_ResizeAppsListView(LauncherGroup* group);
 void LauncherGroups_RegisterDropTargets(LauncherGroup* group);
 void LauncherGroups_RevokeDropTargets(LauncherGroup* group);
 void LauncherGroups_SetAppUserModelId(LauncherGroup* group);
+
+BOOL LauncherGroups_EnsureItemCapacity(LauncherGroup* group, DWORD cItemsNeeded)
+{
+    if (!group)
+    {
+        return FALSE;
+    }
+
+    if (group->items && group->cItemsAlloc >= cItemsNeeded)
+    {
+        return TRUE;
+    }
+
+    DWORD newAlloc = group->cItemsAlloc ? group->cItemsAlloc : EP_LAUNCHER_GROUP_INITIAL_ITEMS;
+    while (newAlloc < cItemsNeeded)
+    {
+        if (newAlloc > EP_LAUNCHER_GROUP_MAX_ITEMS / 2)
+        {
+            newAlloc = EP_LAUNCHER_GROUP_MAX_ITEMS;
+            break;
+        }
+        newAlloc *= 2;
+    }
+
+    LauncherGroupItem* newItems = (LauncherGroupItem*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, newAlloc * sizeof(LauncherGroupItem));
+    if (!newItems)
+    {
+        return FALSE;
+    }
+
+    if (group->items)
+    {
+        if (group->cItems)
+        {
+            memcpy(newItems, group->items, group->cItems * sizeof(LauncherGroupItem));
+        }
+        HeapFree(GetProcessHeap(), 0, group->items);
+    }
+
+    group->items = newItems;
+    group->cItemsAlloc = newAlloc;
+    return TRUE;
+}
+
+void LauncherGroups_FreeItems(LauncherGroup* group)
+{
+    if (!group)
+    {
+        return;
+    }
+
+    if (group->items)
+    {
+        for (DWORD i = 0; i < group->cItems; i++)
+        {
+            if (group->items[i].hIconSmall)
+            {
+                DestroyIcon(group->items[i].hIconSmall);
+            }
+            if (group->items[i].hIconLarge)
+            {
+                DestroyIcon(group->items[i].hIconLarge);
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, group->items);
+        group->items = NULL;
+    }
+    group->cItems = 0;
+    group->cItemsAlloc = 0;
+}
 
 void LauncherGroups_CopyString(WCHAR* dst, size_t cchDst, LPCWSTR src)
 {
@@ -1256,7 +1338,10 @@ BOOL LauncherGroups_SaveItemsToRegistry(LauncherGroup* group)
             {
                 WCHAR valueName[32];
                 swprintf_s(valueName, ARRAYSIZE(valueName), L"Item%lu", i);
-                RegDeleteValueW(hGroupKey, valueName);
+                if (RegDeleteValueW(hGroupKey, valueName) != ERROR_SUCCESS && i >= group->cItems)
+                {
+                    break;
+                }
             }
             for (DWORD i = 0; i < group->cItems; i++)
             {
@@ -1835,6 +1920,10 @@ BOOL LauncherGroups_LoadFromRegistry()
                 continue;
             }
             value[ARRAYSIZE(value) - 1] = L'\0';
+            if (!LauncherGroups_EnsureItemCapacity(group, group->cItems + 1))
+            {
+                break;
+            }
             LauncherGroups_ParseItemValue(value, &group->items[group->cItems]);
             if (group->items[group->cItems].szPath[0])
             {
@@ -1945,6 +2034,121 @@ void LauncherGroups_SetAndSaveViewMode(DWORD viewMode)
     );
 }
 
+DWORD LauncherGroups_ClampColumnsPerRow(DWORD columns)
+{
+    if (columns < EP_LAUNCHER_GROUP_COLUMNS_MIN)
+    {
+        return EP_LAUNCHER_GROUP_COLUMNS_DEFAULT;
+    }
+    if (columns > EP_LAUNCHER_GROUP_COLUMNS_MAX)
+    {
+        return EP_LAUNCHER_GROUP_COLUMNS_MAX;
+    }
+    return columns;
+}
+
+DWORD LauncherGroups_GetColumnsPerRow(DWORD itemCount)
+{
+    DWORD columns = g_launcherGroupsColumnsPerRow;
+
+    if (itemCount && columns > itemCount)
+    {
+        columns = itemCount;
+    }
+    return max(1, (int)columns);
+}
+
+void LauncherGroups_PostColumnsChanged()
+{
+    if (g_launcherGroupsThreadId)
+    {
+        PostThreadMessageW(g_launcherGroupsThreadId, EP_LAUNCHER_GROUP_VIEWMODE_MSG, 0, 0);
+    }
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        if (group->hWnd)
+        {
+            PostMessageW(group->hWnd, EP_LAUNCHER_GROUP_VIEWMODE_MSG, 0, 0);
+        }
+    }
+}
+
+BOOL LauncherGroups_WriteColumnsToRegistry(DWORD columns)
+{
+    HKEY hKey = NULL;
+    BOOL ok = FALSE;
+
+    columns = LauncherGroups_ClampColumnsPerRow(columns);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        ok = RegSetValueExW(hKey, EP_LAUNCHER_GROUP_COLUMNS_VALUE, 0, REG_DWORD, (const BYTE*)&columns, sizeof(columns)) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+    }
+    return ok;
+}
+
+void LauncherGroups_ReadColumnsFromRegistry()
+{
+    HKEY hKey = NULL;
+    DWORD columns = EP_LAUNCHER_GROUP_COLUMNS_DEFAULT;
+    DWORD cb = sizeof(columns);
+    DWORD type = REG_DWORD;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        RegQueryValueExW(hKey, EP_LAUNCHER_GROUP_COLUMNS_VALUE, NULL, &type, (BYTE*)&columns, &cb);
+        RegCloseKey(hKey);
+    }
+    g_launcherGroupsColumnsPerRow = LauncherGroups_ClampColumnsPerRow(columns);
+}
+
+void LauncherGroups_SetAndSaveColumnsPerRow(DWORD columns)
+{
+    columns = LauncherGroups_ClampColumnsPerRow(columns);
+    if (g_launcherGroupsColumnsPerRow != columns)
+    {
+        g_launcherGroupsColumnsPerRow = columns;
+    }
+    LauncherGroups_PostColumnsChanged();
+    EPDebugLogWrite(
+        L"launcher-groups set columns per row=%lu saved=%d",
+        columns,
+        LauncherGroups_WriteColumnsToRegistry(columns)
+    );
+}
+
+int LauncherGroups_PromptForColumnsPerRow(LauncherGroup* group)
+{
+    WCHAR input[16];
+    WCHAR prompt[128];
+    BOOL cancelled = FALSE;
+
+    if (!group)
+    {
+        return 0;
+    }
+
+    swprintf_s(input, ARRAYSIZE(input), L"%lu", g_launcherGroupsColumnsPerRow);
+    swprintf_s(prompt, ARRAYSIZE(prompt), L"\u8bf7\u8f93\u5165\u6bcf\u884c\u663e\u793a\u7684\u9879\u76ee\u6570\uff08%d - %d\uff09",
+        EP_LAUNCHER_GROUP_COLUMNS_MIN, EP_LAUNCHER_GROUP_COLUMNS_MAX);
+
+    group->bKeepVisibleForModal = TRUE;
+    HRESULT hrInput = InputBox(FALSE, group->hWnd, L"\u6BCF\u884C\u6570\u91CF", prompt, input, input, ARRAYSIZE(input), &cancelled);
+    group->bKeepVisibleForModal = FALSE;
+    if (FAILED(hrInput) || cancelled || !input[0])
+    {
+        return 0;
+    }
+
+    WCHAR* end = NULL;
+    long value = wcstol(input, &end, 10);
+    if (end == input || value < EP_LAUNCHER_GROUP_COLUMNS_MIN || value > EP_LAUNCHER_GROUP_COLUMNS_MAX)
+    {
+        return 0;
+    }
+    return (int)value;
+}
+
 int LauncherGroups_GetAppsIconSize(DWORD viewMode)
 {
     switch (viewMode)
@@ -1982,6 +2186,7 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int* pColumns
     int mediumBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_MEDIUM_ICONS));
     int largeBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_LARGE_ICONS));
     DWORD itemCount = count ? count : 1;
+    int maxColumns = (int)LauncherGroups_GetColumnsPerRow(itemCount);
     int columns;
     int rows;
     int cellCx;
@@ -1992,21 +2197,21 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int* pColumns
     switch (viewMode)
     {
     case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
-        columns = (int)min(itemCount, 3);
+        columns = (int)min(itemCount, maxColumns);
         cellCx = max(iconSize + MulDiv(56, iconSize, largeBase), MulDiv(112, iconSize, largeBase));
         cellCy = max(iconSize + MulDiv(80, iconSize, largeBase), MulDiv(124, iconSize, largeBase));
         paddingCx = MulDiv(24, iconSize, largeBase);
         paddingCy = MulDiv(44, iconSize, largeBase);
         break;
     case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
-        columns = (int)min(itemCount, 3);
+        columns = (int)min(itemCount, maxColumns);
         cellCx = max(iconSize + MulDiv(46, iconSize, mediumBase), MulDiv(92, iconSize, mediumBase));
         cellCy = max(iconSize + MulDiv(60, iconSize, mediumBase), MulDiv(100, iconSize, mediumBase));
         paddingCx = MulDiv(24, iconSize, mediumBase);
         paddingCy = MulDiv(40, iconSize, mediumBase);
         break;
     case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
-        columns = (int)min(itemCount, 3);
+        columns = (int)min(itemCount, maxColumns);
         cellCx = max(iconSize + MulDiv(36, iconSize, smallBase), MulDiv(60, iconSize, smallBase));
         cellCy = max(iconSize + MulDiv(40, iconSize, smallBase), MulDiv(66, iconSize, smallBase));
         paddingCx = MulDiv(22, iconSize, smallBase);
@@ -2173,6 +2378,8 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
     int cellCy;
     int paddingCx;
     int paddingCy;
+    int maxCx;
+    int maxCy;
 
     size.cx = 300;
     size.cy = 160;
@@ -2186,6 +2393,27 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
         size.cx = max(MulDiv(320, iconSize, smallBase), iconSize + MulDiv(280, iconSize, smallBase));
         size.cy = max(MulDiv(120, iconSize, smallBase), (int)count * max(iconSize + MulDiv(12, iconSize, smallBase), MulDiv(28, iconSize, smallBase)) + MulDiv(76, iconSize, smallBase));
     }
+
+    if (group && group->hWnd && IsWindow(group->hWnd))
+    {
+        HMONITOR hMonitor = MonitorFromWindow(group->hWnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi;
+        mi.cbSize = sizeof(mi);
+        if (hMonitor && GetMonitorInfoW(hMonitor, &mi))
+        {
+            maxCx = (mi.rcWork.right - mi.rcWork.left) - 32;
+            maxCy = (mi.rcWork.bottom - mi.rcWork.top) - 32;
+            if (maxCx > 240)
+            {
+                size.cx = min(size.cx, maxCx);
+            }
+            if (maxCy > 160)
+            {
+                size.cy = min(size.cy, maxCy);
+            }
+        }
+    }
+
     LauncherGroups_AdjustAppsWindowSizeForFrame(group, &size);
     return size;
 }
@@ -2669,6 +2897,7 @@ void LauncherGroups_FreeGroup(LauncherGroup* group)
             DestroyIcon(group->items[i].hIconLarge);
         }
     }
+    LauncherGroups_FreeItems(group);
     free(group);
 }
 
@@ -2734,7 +2963,8 @@ BOOL LauncherGroups_AddWindowToGroup(LauncherGroup* group, HWND hSourceWnd)
     HKEY hGroupKey = NULL;
     BOOL ok = FALSE;
 
-    if (!group || group->cItems >= EP_LAUNCHER_GROUP_MAX_ITEMS)
+    if (!group || group->cItems >= EP_LAUNCHER_GROUP_MAX_ITEMS
+        || !LauncherGroups_EnsureItemCapacity(group, group->cItems + 1))
     {
         return FALSE;
     }
@@ -2827,7 +3057,8 @@ BOOL LauncherGroups_AddPathToGroup(LauncherGroup* group, LPCWSTR path)
     BOOL ok = FALSE;
     LPCWSTR fileName;
 
-    if (!group || !path || !path[0] || group->cItems >= EP_LAUNCHER_GROUP_MAX_ITEMS)
+    if (!group || !path || !path[0] || group->cItems >= EP_LAUNCHER_GROUP_MAX_ITEMS
+        || !LauncherGroups_EnsureItemCapacity(group, group->cItems + 1))
     {
         return FALSE;
     }
@@ -3252,6 +3483,7 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
 {
     HMENU hMenu;
     HMENU hViewMenu;
+    HMENU hArrangeMenu;
     POINT pt;
     int cmd;
     HWND hSourceWnd;
@@ -3289,6 +3521,27 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
             MF_BYCOMMAND
         );
         AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hViewMenu, L"\u663E\u793A\u65B9\u5F0F");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+
+    hArrangeMenu = CreatePopupMenu();
+    if (hArrangeMenu)
+    {
+        AppendMenuW(hArrangeMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ARRANGE_3, L"\u6BCF\u884C 3 \u4E2A");
+        AppendMenuW(hArrangeMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ARRANGE_4, L"\u6BCF\u884C 4 \u4E2A");
+        AppendMenuW(hArrangeMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ARRANGE_5, L"\u6BCF\u884C 5 \u4E2A");
+        AppendMenuW(hArrangeMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_ARRANGE_CUSTOM, L"\u81EA\u5B9A\u4E49\u6570\u91CF...");
+        if (g_launcherGroupsColumnsPerRow >= 3 && g_launcherGroupsColumnsPerRow <= 5)
+        {
+            CheckMenuRadioItem(
+                hArrangeMenu,
+                EP_LAUNCHER_GROUP_MENU_ARRANGE_3,
+                EP_LAUNCHER_GROUP_MENU_ARRANGE_5,
+                EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST + (g_launcherGroupsColumnsPerRow - 3),
+                MF_BYCOMMAND
+            );
+        }
+        AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hArrangeMenu, L"\u6392\u5217\u6A21\u5F0F");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
 
@@ -3351,6 +3604,36 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
         if (group->bAppsVisible)
         {
             LauncherGroups_PositionAppsWindow(group);
+        }
+    }
+    else if (cmd >= EP_LAUNCHER_GROUP_MENU_ARRANGE_FIRST && cmd <= EP_LAUNCHER_GROUP_MENU_ARRANGE_CUSTOM)
+    {
+        DWORD columns = 0;
+        if (cmd == EP_LAUNCHER_GROUP_MENU_ARRANGE_CUSTOM)
+        {
+            int custom = LauncherGroups_PromptForColumnsPerRow(group);
+            if (custom <= 0)
+            {
+                columns = 0;
+            }
+            else
+            {
+                columns = (DWORD)custom;
+            }
+        }
+        else
+        {
+            columns = 3 + (DWORD)(cmd - EP_LAUNCHER_GROUP_MENU_ARRANGE_3);
+        }
+
+        if (columns)
+        {
+            LauncherGroups_SetAndSaveColumnsPerRow(columns);
+            LauncherGroups_UpdateAppsWindow(group);
+            if (group->bAppsVisible)
+            {
+                LauncherGroups_PositionAppsWindow(group);
+            }
         }
     }
     else if (cmd >= EP_LAUNCHER_GROUP_MENU_REMOVE_FIRST && cmd <= EP_LAUNCHER_GROUP_MENU_REMOVE_LAST)
@@ -3721,6 +4004,7 @@ DWORD LauncherGroupsThread(DWORD unused)
     PeekMessageW(&dummyMsg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
     g_launcherGroupsThreadId = GetCurrentThreadId();
     g_launcherGroupsViewMode = LauncherGroups_ReadViewModeFromRegistry();
+    LauncherGroups_ReadColumnsFromRegistry();
 
     ZeroMemory(&icc, sizeof(icc));
     icc.dwSize = sizeof(icc);

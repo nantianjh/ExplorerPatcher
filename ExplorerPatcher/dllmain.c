@@ -2119,7 +2119,8 @@ void LauncherGroups_SetAndSaveColumnsPerRow(DWORD columns)
 
 int LauncherGroups_PromptForColumnsPerRow(LauncherGroup* group)
 {
-    WCHAR input[16];
+    WCHAR answer[16];
+    WCHAR defaultValue[16];
     WCHAR prompt[128];
     BOOL cancelled = FALSE;
 
@@ -2128,21 +2129,21 @@ int LauncherGroups_PromptForColumnsPerRow(LauncherGroup* group)
         return 0;
     }
 
-    swprintf_s(input, ARRAYSIZE(input), L"%lu", g_launcherGroupsColumnsPerRow);
-    swprintf_s(prompt, ARRAYSIZE(prompt), L"\u8bf7\u8f93\u5165\u6bcf\u884c\u663e\u793a\u7684\u9879\u76ee\u6570\uff08%d - %d\uff09",
+    swprintf_s(defaultValue, ARRAYSIZE(defaultValue), L"%lu", g_launcherGroupsColumnsPerRow);
+    swprintf_s(prompt, ARRAYSIZE(prompt), L"\u8BF7\u8F93\u5165\u6BCF\u884C\u663E\u793A\u7684\u9879\u76EE\u6570\uFF08%d - %d\uFF09",
         EP_LAUNCHER_GROUP_COLUMNS_MIN, EP_LAUNCHER_GROUP_COLUMNS_MAX);
 
     group->bKeepVisibleForModal = TRUE;
-    HRESULT hrInput = InputBox(FALSE, group->hWnd, L"\u6BCF\u884C\u6570\u91CF", prompt, input, input, ARRAYSIZE(input), &cancelled);
+    HRESULT hrInput = InputBox(FALSE, group->hWnd, prompt, L"\u6BCF\u884C\u6570\u91CF", defaultValue, answer, ARRAYSIZE(answer), &cancelled);
     group->bKeepVisibleForModal = FALSE;
-    if (FAILED(hrInput) || cancelled || !input[0])
+    if (FAILED(hrInput) || cancelled || !answer[0])
     {
         return 0;
     }
 
     WCHAR* end = NULL;
-    long value = wcstol(input, &end, 10);
-    if (end == input || value < EP_LAUNCHER_GROUP_COLUMNS_MIN || value > EP_LAUNCHER_GROUP_COLUMNS_MAX)
+    long value = wcstol(answer, &end, 10);
+    if (end == answer || value < EP_LAUNCHER_GROUP_COLUMNS_MIN || value > EP_LAUNCHER_GROUP_COLUMNS_MAX)
     {
         return 0;
     }

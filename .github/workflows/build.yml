@@ -14,7 +14,7 @@ on:
         required: false
 
 env:
-  SOLUTION_FILE_PATH: .
+  SOLUTION_FILE_PATH: ExplorerPatcher.sln
   BUILD_CONFIGURATION: Release
 
 permissions:

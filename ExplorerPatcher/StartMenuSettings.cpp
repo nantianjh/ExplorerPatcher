@@ -1261,6 +1261,738 @@ HRESULT PatchUnifiedTilePinUnpinProvider(HMODULE hModule)
     return S_OK;
 }
 
+#define FIND_PATTERN_WITH_GAP(pFile, dwSize, pat1, msk1, siz1, gap1and2, pat2, msk2, siz2, postprocess, dest) \
+	do \
+	{ \
+		PBYTE pCurrent = (pFile); \
+		while (pCurrent + (siz1) + (gap1and2) + (siz2) < (pFile) + (dwSize)) \
+		{ \
+			PBYTE matchLocal = (PBYTE)FindPattern( \
+				pCurrent, \
+				(SIZE_T)(dwSize) - (SIZE_T)(pCurrent - (SIZE_T)(pFile)), \
+				(pat1), \
+				(msk1) \
+			); \
+			if (!matchLocal) \
+			{ \
+				break; /* We tried our best, but we found nothing... */ \
+			} \
+ 			\
+			/* Possible match, shift to continuation search start */ \
+			pCurrent = matchLocal + (siz1); \
+ 			\
+			if (!(pCurrent + (gap1and2) + (siz2) < (pFile) + (dwSize))) \
+			{ \
+				break; /* Not enough space for continuation */ \
+			} \
+ 			\
+			/* Check continuation */ \
+			PBYTE matchContinuationTest = (PBYTE)FindPattern( \
+				pCurrent, \
+				(gap1and2) + (siz2), \
+				(pat2), \
+				(msk2) \
+			); \
+			if (!matchContinuationTest) \
+			{ \
+				continue; /* Not this one, continue at first pattern + pattern size */ \
+			} \
+ 			\
+			matchLocal = (postprocess)(matchLocal); \
+			if (!matchLocal) \
+			{ \
+				continue; /* Not this one, continue at first pattern + pattern size */ \
+			} \
+ 			\
+			*(dest) = matchLocal; \
+			break; /* Got it! */ \
+		} \
+	} \
+	while (false)
+
+// ALL pointers and sizes must be multiples of 4
+#define FIND_PATTERN_WITH_GAP_ARM(pFile, dwSize, pat1, msk1, siz1, gap1and2, pat2, msk2, siz2, postprocess, dest) \
+	do \
+	{ \
+		PBYTE pCurrent = (pFile); \
+		while (pCurrent + (siz1) + (gap1and2) + (siz2) < (pFile) + (dwSize)) \
+		{ \
+			PBYTE matchLocal = (PBYTE)FindPatternBitMask_4_( \
+				pCurrent, \
+				(SIZE_T)(dwSize) - (SIZE_T)(pCurrent - (SIZE_T)(pFile)), \
+				(pat1), \
+				(msk1), \
+				(siz1) \
+			); \
+			if (!matchLocal) \
+			{ \
+				break; /* We tried our best, but we found nothing... */ \
+			} \
+ 			\
+			/* Possible match, shift to continuation search start */ \
+			pCurrent = matchLocal + (siz1); \
+ 			\
+			if (!(pCurrent + (gap1and2) + (siz2) < (pFile) + (dwSize))) \
+			{ \
+				break; /* Not enough space for continuation */ \
+			} \
+ 			\
+			/* Check continuation */ \
+			PBYTE matchContinuationTest = (PBYTE)FindPatternBitMask_4_( \
+				pCurrent, \
+				(gap1and2) + (siz2), \
+				(pat2), \
+				(msk2), \
+				(siz2) \
+			); \
+			if (!matchContinuationTest) \
+			{ \
+				continue; /* Not this one, continue at first pattern + pattern size */ \
+			} \
+ 			\
+			matchLocal = (postprocess)(matchLocal); \
+			if (!matchLocal) \
+			{ \
+				continue; /* Not this one, continue at first pattern + pattern size */ \
+			} \
+ 			\
+			*(dest) = matchLocal; \
+			break; /* Got it! */ \
+		} \
+	} \
+	while (false)
+
+void* g_ctc_MakeAndInitialize_CDSStartCollectionWriter_Func;
+void* g_ctc_CreateLayoutInitializationLayoutRoot_Func;
+void* g_ctc_MakeAndInitialize_CDSLayoutProvider_Func;
+void* g_ctc_MakeShared_LayoutRootInternal_Func;
+
+void* (__thiscall *g_ctc_LayoutRootInternal_CtorWithTransformerRoot_Func)(void* _this, void* context, void* transformerRoot);
+void* (__thiscall *g_pfnLayoutRootInternal_CtorWithTransformerRoot)(void* _this, void* context, void* transformerRoot);
+void* g_LayoutRootInternal_CtorWithTransformerRoot_expectedReturnAddress;
+
+void* __thiscall ctc_LayoutRootInternal_CtorWithTransformerRoot_Hook(void* _this, void* context, void* transformerRoot)
+{
+    if (_ReturnAddress() == g_LayoutRootInternal_CtorWithTransformerRoot_expectedReturnAddress)
+    {
+        return g_pfnLayoutRootInternal_CtorWithTransformerRoot(_this, context, transformerRoot);
+    }
+    else
+    {
+        return g_ctc_LayoutRootInternal_CtorWithTransformerRoot_Func(_this, context, transformerRoot);
+    }
+}
+
+// void* g_ctc_MakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor_Func;
+void* g_ctc_LogAllTilesActivity_Dtor_Func;
+void* g_ctc_Create_StartTileGridCollection;
+
+HRESULT BringBackSharedStartLayoutInCuratedTileCollections(HMODULE hModule)
+{
+    PBYTE pText;
+    DWORD cbText;
+    RETURN_HR_IF(E_NOT_SET, !TextSectionBeginAndSize(hModule, &pText, &cbText));
+
+    // Microsoft::WRL::Details::MakeAndInitialize<ctc::CDSStartCollectionWriter,ctc::ICollectionWriter,std::wstring &,bool,std::shared_ptr<ctc::CollectionContext> const &>()
+    PBYTE matchMakeAndInitialize_CDSStartCollectionWriter = nullptr;
+#if defined(_M_X64)
+    // - GetCDSStartCollectionWriter() non-inlined (16299, 26100 ~)
+    // 48 8B D7 E8 ?? ?? ?? ?? 8B D8 48 8B CF E8 ?? ?? ?? ?? 8B C3
+    //             ^^^^^^^^^^^
+    // Ref: ctc::GetCDSStartCollectionWriter()
+    matchMakeAndInitialize_CDSStartCollectionWriter = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x48\x8B\xD7\xE8\x00\x00\x00\x00\x8B\xD8\x48\x8B\xCF\xE8\x00\x00\x00\x00\x8B\xC3",
+        "xxxx????xxxxxx????xx"
+    );
+    if (matchMakeAndInitialize_CDSStartCollectionWriter)
+    {
+        matchMakeAndInitialize_CDSStartCollectionWriter += 3;
+        matchMakeAndInitialize_CDSStartCollectionWriter += 5 + *(int*)(matchMakeAndInitialize_CDSStartCollectionWriter + 1);
+    }
+    else
+    {
+        // - GetCDSStartCollectionWriter() inlined (17134 ~ 22621)
+        // E8 ?? ?? ?? ?? 8B F0 49 8B CE E8 ?? ?? ?? ?? 48 8B 4D 5F
+        //    ^^^^^^^^^^^ . Pattern begins here
+        // Ref: ctc::StartTileGridCollectionInitializer::CreateStartCollectionPipeline()
+        matchMakeAndInitialize_CDSStartCollectionWriter = (PBYTE)FindPattern(
+            pText, cbText,
+            "\x8B\xF0\x49\x8B\xCE\xE8\x00\x00\x00\x00\x48\x8B\x4D\x5F",
+            "xxxxxx????xxxx"
+        );
+        if (matchMakeAndInitialize_CDSStartCollectionWriter)
+        {
+            matchMakeAndInitialize_CDSStartCollectionWriter -= 5;
+            if (matchMakeAndInitialize_CDSStartCollectionWriter >= pText && *matchMakeAndInitialize_CDSStartCollectionWriter == 0xE8)
+            {
+                matchMakeAndInitialize_CDSStartCollectionWriter += 5 + *(int*)(matchMakeAndInitialize_CDSStartCollectionWriter + 1);
+            }
+            else
+            {
+                matchMakeAndInitialize_CDSStartCollectionWriter = nullptr;
+            }
+        }
+    }
+#elif defined(_M_ARM64)
+    // - GetCDSStartCollectionWriter() non-inlined (26100 ~)
+    // E1 03 13 AA ?? ?? ?? ?? F4 03 00 2A E0 03 13 AA
+    //             ^^^^^^^^^^^
+    // Ref: ctc::GetCDSStartCollectionWriter()
+    matchMakeAndInitialize_CDSStartCollectionWriter = (PBYTE)FindPattern_4_(
+        pText, cbText,
+        "\xE1\x03\x13\xAA\x00\x00\x00\x00\xF4\x03\x00\x2A\xE0\x03\x13\xAA",
+        "xxxx????xxxxxxxx"
+    );
+    if (matchMakeAndInitialize_CDSStartCollectionWriter)
+    {
+        matchMakeAndInitialize_CDSStartCollectionWriter += 4;
+        matchMakeAndInitialize_CDSStartCollectionWriter = (PBYTE)ARM64_FollowBL((DWORD*)matchMakeAndInitialize_CDSStartCollectionWriter);
+    }
+    else
+    {
+        // - GetCDSStartCollectionWriter() inlined (20348 ~ 25398)
+        // ?? 42 00 91 ?? ?? ?? ?? ?? 03 00 2A ... ?? 02 00 F9 28 00 80 52
+        //             ^^^^^^^^^^^
+        // ADD X0, X??, #0x10
+        //   P: 0b10010001_00_000000010000_?????_00000 = 91004000 = 00 40 00 91
+        //   M: 0b11111111_11_111111111111_00000_11111 = FFFFFC1F = 1F FC FF FF
+        // ORR W??, WZR, W0 (MOV W??, W0)
+        //   P: 0b00101010_00_0_00000_000000_11111_????? = 2A0003E0 = E0 03 00 2A
+        //   M: 0b11111111_11_1_11111_111111_11111_00000 = FFFFFFE0 = E0 FF FF FF
+        // STR XZR, [X??]
+        //   P: 0b1111100100_000000000000_?????_11111 = F900001F = 1F 00 00 F9
+        //   M: 0b1111111111_111111111111_00000_11111 = FFFFFC1F = 1F FC FF FF
+        // Ref: ctc::StartTileGridCollectionInitializer::CreateStartCollectionPipeline()
+        FIND_PATTERN_WITH_GAP_ARM(
+            pText, cbText,
+
+            "\x00\x40\x00\x91\x00\x00\x00\x94\xE0\x03\x00\x2A",
+            "\x1F\xFC\xFF\xFF\x00\x00\x00\xFC\xE0\xFF\xFF\xFF",
+            12,
+
+            44,
+
+            "\x1F\x00\x00\xF9\x28\x00\x80\x52",
+            "\x1F\xFC\xFF\xFF\xFF\xFF\xFF\xFF",
+            8,
+
+            [&](PBYTE matchCandidate) -> PBYTE
+            {
+                matchCandidate += 4;
+                return (PBYTE)ARM64_FollowBL((DWORD*)matchCandidate);
+            },
+
+            &matchMakeAndInitialize_CDSStartCollectionWriter
+        );
+    }
+#endif
+
+    // ctc::Internal::LayoutRoot::CreateLayoutInitializationLayoutRoot()
+    PBYTE matchCreateLayoutInitializationLayoutRoot = nullptr;
+#if defined(_M_X64)
+    // 16299 ~
+    // 48 8D 4D ?? E8 ?? ?? ?? ?? 90 48 8D 4D ?? E8 ?? ?? ?? ?? 48 8B ?? 48 89 ?? ?? 48
+    //                ^^^^^^^^^^^
+    // Ref: ctc::DefaultLayoutParser::ParseStartLayouts()
+    matchCreateLayoutInitializationLayoutRoot = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x48\x8D\x4D\x00\xE8\x00\x00\x00\x00\x90\x48\x8D\x4D\x00\xE8\x00\x00\x00\x00\x48\x8B\x00\x48\x89\x00\x00\x48",
+        "xxx?x????xxxx?x????xx?xx??x"
+    );
+    if (matchCreateLayoutInitializationLayoutRoot)
+    {
+        matchCreateLayoutInitializationLayoutRoot += 4;
+        matchCreateLayoutInitializationLayoutRoot += 5 + *(int*)(matchCreateLayoutInitializationLayoutRoot + 1);
+    }
+#elif defined(_M_ARM64)
+    // ?? 42 03 91 ?? E3 00 91 ?? ?? ?? ?? 1F 20 03 D5 A0 63 00 91
+    //                         ^^^^^^^^^^^
+    // Ref: ctc::DefaultLayoutParser::ParseStartLayouts()
+    matchCreateLayoutInitializationLayoutRoot = (PBYTE)FindPattern_4_(
+        pText + 1, cbText - 1,
+        "\x42\x03\x91\x0\xE3\x00\x91\x0\x0\x0\x0\x1F\x20\x03\xD5\xA0\x63\x00\x91",
+        "xxx?xxx????xxxxxxxx"
+    );
+    if (matchCreateLayoutInitializationLayoutRoot)
+    {
+        matchCreateLayoutInitializationLayoutRoot += 7;
+        matchCreateLayoutInitializationLayoutRoot = (PBYTE)ARM64_FollowBL((DWORD*)matchCreateLayoutInitializationLayoutRoot);
+    }
+#endif
+
+    // Microsoft::WRL::Details::MakeAndInitialize<ctc::CDSLayoutProvider,ctc::IInitialCollectionProvider,unsigned short const (&)[15],std::shared_ptr<ctc::CollectionContext> const &>
+    PBYTE matchMakeAndInitialize_CDSLayoutProvider = nullptr;
+#if defined(_M_X64)
+    // 16299 ~
+    // 4C 8D 41 08 48 8B CA E8 ?? ?? ?? ?? 85 C0 79 1A
+    //                         ^^^^^^^^^^^
+    // Ref: ctc::AppendWin8UpgradeTilesPolicy::GetCustomProvider()
+    // Warning: a2 is optimized out to be always L"Start.TileGrid"
+    matchMakeAndInitialize_CDSLayoutProvider = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x4C\x8D\x41\x08\x48\x8B\xCA\xE8\x00\x00\x00\x00\x85\xC0\x79\x1A",
+        "xxxxxxxx????xxxx"
+    );
+    if (matchMakeAndInitialize_CDSLayoutProvider)
+    {
+        matchMakeAndInitialize_CDSLayoutProvider += 7;
+        matchMakeAndInitialize_CDSLayoutProvider += 5 + *(int*)(matchMakeAndInitialize_CDSLayoutProvider + 1);
+    }
+#elif defined(_M_ARM64)
+    // 02 20 00 91 E0 03 13 AA ?? ?? ?? ?? E3 03 00 2A
+    //                         ^^^^^^^^^^^
+    // Ref: ctc::AppendWin8UpgradeTilesPolicy::GetCustomProvider()
+    // Warning: a2 is optimized out to be always L"Start.TileGrid"
+    matchMakeAndInitialize_CDSLayoutProvider = (PBYTE)FindPattern_4_(
+        pText, cbText,
+        "\x02\x20\x00\x91\xE0\x03\x13\xAA\x00\x00\x00\x00\xE3\x03\x00\x2A",
+        "xxxxxxxx????xxxx"
+    );
+    if (matchMakeAndInitialize_CDSLayoutProvider)
+    {
+        matchMakeAndInitialize_CDSLayoutProvider += 8;
+        matchMakeAndInitialize_CDSLayoutProvider = (PBYTE)ARM64_FollowBL((DWORD*)matchMakeAndInitialize_CDSLayoutProvider);
+    }
+#endif
+
+    // std::make_shared<ctc::Internal::LayoutRootInternal,std::shared_ptr<ctc::CollectionContext> &,std::shared_ptr<DataStoreCache::CuratedTileCollectionTransformer::CuratedRoot> >()
+    PBYTE matchMakeShared_LayoutRootInternal = nullptr;
+    bool bIsInlined_MakeShared_LayoutRootInternal = false;
+    PBYTE matchLayoutRootInternal_CtorWithTransformerRoot = nullptr;
+#if defined(_M_X64)
+    // 16299 ~
+    // E8 ?? ?? ?? ?? 48 8B D0 ?? 8D ?? 10 E8 ?? ?? ?? ?? 48 8B ?? 24
+    //    ^^^^^^^^^^^ . Pattern begins here
+    // The 48 8B ?? 24 can be:
+    // - 48 8B 4C 24 70          <continuation 1 byte after first pattern + pattern size>
+    // - 48 8B 8C 24 80 00 00 00 <continuation 4 bytes ...>
+    //               . First pattern + pattern size
+    //               ----------- 4 bytes max gap
+    // Continued by:
+    // 48 85 C9 74 06 E8 ?? ?? ?? ?? 90 48 8B ?? 24
+    // Ref: ctc::PreserveLayoutPostProcessor::RuntimeClassInitialize()
+    FIND_PATTERN_WITH_GAP(
+        pText, cbText,
+
+        "\x48\x8B\xD0\x00\x8D\x00\x10\xE8\x00\x00\x00\x00\x48\x8B\x00\x24",
+        "xxx?x?xx????xx?x",
+        16,
+
+        4,
+
+        "\x48\x85\xC9\x74\x06\xE8\x00\x00\x00\x00\x90\x48\x8B\x00\x24",
+        "xxxxxx????xxx?x",
+        15,
+
+        [&](PBYTE matchCandidate) -> PBYTE
+        {
+            matchCandidate -= 5;
+            if (matchCandidate >= pText && *matchCandidate == 0xE8)
+            {
+                return matchCandidate + 5 + *(int*)(matchCandidate + 1);
+            }
+            else
+            {
+                return nullptr;
+            }
+        },
+
+        &matchMakeShared_LayoutRootInternal
+    );
+#elif defined(_M_ARM64)
+    // ?? 82 00 91 ?? ?? ?? ?? E1 03 00 AA ?? 42 00 91
+    //             ^^^^^^^^^^^
+    // Ref: ctc::PreserveLayoutPostProcessor::RuntimeClassInitialize()
+    matchMakeShared_LayoutRootInternal = (PBYTE)FindPattern_4_(
+        pText + 1, cbText - 1,
+        "\x82\x00\x91\x00\x00\x00\x00\xE1\x03\x00\xAA\x00\x42\x00\x91",
+        "xxx????xxxx?xxx"
+    );
+    if (matchMakeShared_LayoutRootInternal)
+    {
+        matchMakeShared_LayoutRootInternal += 3;
+        matchMakeShared_LayoutRootInternal = (PBYTE)ARM64_FollowBL((DWORD*)matchMakeShared_LayoutRootInternal);
+    }
+    else
+    {
+        // Note: 26100+ make_shared is inlined here
+        // 00 2E 80 D2 ?? ?? ?? ?? F3 03 00 AA B3 0B 00 F9 ?? ?? ?? ?? ?? ?? ?? ?? E9 03 00 B2 A2 83 01 91 68 26 00 A9
+        //                                                 ^^^^^^^^^^^^^^^^^^^^^^^ std::_Ref_count_obj2 vtbl
+        // A7 ?? C0 ?? ?? 82 00 91 60 42 00 91 BF 7F ?? A9 A7 1B 80 3D ?? ?? ?? ?? 1F 20 03 D5 68 42 00 91 A1 43 00 91
+        //                                                             ^^^^^^^^^^^ Ctor
+        // A8 4F 01 A9 ?? 42 00 91 ?? ?? ?? ?? A0 0F 40 F9
+        //
+        matchMakeShared_LayoutRootInternal = (PBYTE)FindPattern_4_(
+            pText, cbText,
+            "\x00\x2E\x80\xD2\x00\x00\x00\x00\xF3\x03\x00\xAA\xB3\x0B\x00\xF9\x00\x00\x00\x00\x00\x00\x00\x00\xE9\x03\x00\xB2\xA2\x83\x01\x91\x68\x26\x00\xA9\xA7\x00\xC0\x00\x00\x82\x00\x91\x60\x42\x00\x91\xBF\x7F\x00\xA9\xA7\x1B\x80\x3D\x00\x00\x00\x00\x1F\x20\x03\xD5\x68\x42\x00\x91\xA1\x43\x00\x91\xA8\x4F\x01\xA9\x00\x42\x00\x91\x00\x00\x00\x00\xA0\x0F\x40\xF9",
+            "xxxx????xxxxxxxx????????xxxxxxxxxxxxx?x??xxxxxxxxx?xxxxx????xxxxxxxxxxxxxxxx?xxx????xxxx"
+        );
+        if (matchMakeShared_LayoutRootInternal)
+        {
+            bIsInlined_MakeShared_LayoutRootInternal = true;
+
+            matchLayoutRootInternal_CtorWithTransformerRoot = matchMakeShared_LayoutRootInternal + 56;
+            matchLayoutRootInternal_CtorWithTransformerRoot = (PBYTE)ARM64_FollowBL((DWORD*)matchLayoutRootInternal_CtorWithTransformerRoot);
+            if (!matchLayoutRootInternal_CtorWithTransformerRoot)
+            {
+                matchMakeShared_LayoutRootInternal = nullptr;
+            }
+
+            g_LayoutRootInternal_CtorWithTransformerRoot_expectedReturnAddress = matchMakeShared_LayoutRootInternal + 60;
+        }
+    }
+#endif
+
+#if 0
+    // wil::MakeAndInitializeOrThrow<ctc::Win8LayoutMigrationPostProcessor,HSTRING__ * &,std::shared_ptr<ctc::CollectionContext> const &>()
+    PBYTE matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = nullptr;
+#if defined(_M_X64)
+    // - ctc::CreateWin8LayoutMigrationPostProcessor() inlined (17134 ~)
+    // 4C 8D 41 08 48 8D 55 28 48 8D 4D 30 E8 ?? ?? ?? ?? 48 8B 08 48 ?? ?? 00
+    //                                        ^^^^^^^^^^^
+    // 48 ?? ?? 00 ... can be:
+    // - 48 83 20 00          <continuation 0 bytes after first pattern + pattern size>
+    // - 48 C7 00 00 00 00 00 <continuation 3 bytes ...>
+    //               . First pattern + pattern size
+    //               -------- 3 bytes max gap
+    // Continued by:
+    // 48 89 4D 18 C7 45 D8 02 00 00 00
+    // Ref: ctc::AppendWin8UpgradeTilesPolicy::GetPostProcessors()
+    /*FIND_PATTERN_WITH_GAP(
+        pText, cbText,
+
+        "\x4C\x8D\x41\x08\x48\x8D\x55\x28\x48\x8D\x4D\x30\xE8\x00\x00\x00\x00\x48\x8B\x08\x48\x00\x00\x00",
+        "xxxxxxxxxxxxx????xxxx??x",
+        24,
+
+        3,
+
+        "\x48\x89\x4D\x18\xC7\x45\xD8\x02\x00\x00\x00",
+        "xxxxxxxxxxx",
+        11,
+
+        [&](PBYTE matchCandidate) -> PBYTE
+        {
+            matchCandidate += 12;
+            return matchCandidate + 5 + *(int*)(matchCandidate + 1);
+        },
+
+        &matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor,
+    );*/ // This complex 2-step method is not needed
+    matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x4C\x8D\x41\x08\x48\x8D\x55\x28\x48\x8D\x4D\x30\xE8\x00\x00\x00\x00\x48\x8B\x08\x48\x00\x00\x00",
+        "xxxxxxxxxxxxx????xxxx??x"
+    );
+    if (matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor)
+    {
+        matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor += 12;
+        matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor += 5 + *(int*)(matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor + 1);
+    }
+    else
+    {
+        // !!! (Please comment this outside the suite, we're not patching 16299 ctc) !!!
+
+        // - ctc::CreateWin8LayoutMigrationPostProcessor() non-inlined (16299)
+        // Instead look for Microsoft::WRL::Details::MakeAndInitialize<ctc::Win8LayoutMigrationPostProcessor,ctc::Win8LayoutMigrationPostProcessor,HSTRING__ * &,std::shared_ptr<ctc::CollectionContext> const &>()
+        // 4C 8B C3 48 8D 54 24 48 48 8D 4C 24 58 E8 ?? ?? ?? ?? 48 8B 4C 24 38 85 C0
+        //                                           ^^^^^^^^^^^
+        // Ref: ctc::CreateWin8LayoutMigrationPostProcessor()
+        matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = (PBYTE)FindPattern(
+            pText, cbText,
+            "\x4C\x8B\xC3\x48\x8D\x54\x24\x48\x48\x8D\x4C\x24\x58\xE8\x0\x0\x0\x0\x48\x8B\x4C\x24\x38\x85\xC0",
+            "xxxxxxxxxxxxxx????xxxxxxx"
+        );
+        if (matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor)
+        {
+            matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor += 13;
+            matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor += 5 + *(int*)(matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor + 1);
+        }
+    }
+#elif defined(_M_ARM64)
+    // A1 83 00 91 A0 A3 00 91 A8 13 00 F9 ?? ?? ?? ?? ... (max 16, 21 including masks) ?? 00 80 52
+    //                                     ^^^^^^^^^^^
+    // Ref: ctc::PreserveLayoutPostProcessor::RuntimeClassInitialize()
+    FIND_PATTERN_WITH_GAP(
+        pText, cbText,
+
+        "\xA1\x83\x00\x91\xA0\xA3\x00\x91\xA8\x13\x00\xF9",
+        "xxxxxxxxxxxx",
+        12,
+
+        21,
+
+        "\x00\x80\x52",
+        "xxx",
+        3,
+
+        [&](PBYTE matchCandidate) -> PBYTE
+        {
+            matchCandidate += 12;
+            return (PBYTE)ARM64_FollowBL((DWORD*)matchCandidate);
+        },
+
+        &matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor,
+    );
+    /*matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = (PBYTE)FindPatternBitMask_4_(
+        pText, cbText,
+        "\xA1\x83\x00\x91\xA0\xA3\x00\x91\xA8\x13\x00\xF9\x00\x00\x00\x94",
+        "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\xFC",
+        16,
+    );
+    if (matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor)
+    {
+        matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor += 12;
+        matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = (PBYTE)ARM64_FollowBL((DWORD*)matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor);
+    }*/
+#endif
+#endif
+
+    // CommonStartTelemetry::LogAllTilesActivity::~LogAllTilesActivity()
+    PBYTE matchLogAllTilesActivity_Dtor = nullptr;
+#if defined(_M_X64)
+    // 16299~
+    // 48 85 C9 74 06 E8 ?? ?? ?? ?? 90 49 8B ?? E8 ?? ?? ?? ?? 33 C0 48 8B 4D ?? 48 33 CC
+    //                                              ^^^^^^^^^^^
+    // Ref: ctc::GenericCollectionWriter::WriteCollection()
+    matchLogAllTilesActivity_Dtor = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x48\x85\xC9\x74\x06\xE8\x00\x00\x00\x00\x90\x49\x8B\x00\xE8\x00\x00\x00\x00\x33\xC0\x48\x8B\x4D\x00\x48\x33\xCC",
+        "xxxxxx????xxx?x????xxxxx?xxx"
+    );
+    if (matchLogAllTilesActivity_Dtor)
+    {
+        matchLogAllTilesActivity_Dtor += 14;
+        matchLogAllTilesActivity_Dtor += 5 + *(int*)(matchLogAllTilesActivity_Dtor + 1);
+    }
+#elif defined(_M_ARM64)
+    // ?? ?? 40 F9 60 00 00 B4 ?? ?? ?? ?? 1F 20 03 D5 E0 03 ?? AA ?? ?? ?? ?? 00 00 80 52 FF 43 01 91
+    //                                                             ^^^^^^^^^^^
+    // Ref: ctc::GenericCollectionWriter::WriteCollection()
+    matchLogAllTilesActivity_Dtor = (PBYTE)FindPattern_4_(
+        pText + 2, cbText - 2,
+        "\x40\xF9\x60\x00\x00\xB4\x00\x00\x00\x00\x1F\x20\x03\xD5\xE0\x03\x00\xAA\x00\x00\x00\x00\x00\x00\x80\x52\xFF\x43\x01\x91",
+        "xxxxxx????xxxxxx?x????xxxxxxxx"
+    );
+    if (matchLogAllTilesActivity_Dtor)
+    {
+        matchLogAllTilesActivity_Dtor += 18;
+        matchLogAllTilesActivity_Dtor = (PBYTE)ARM64_FollowBL((DWORD*)matchLogAllTilesActivity_Dtor);
+    }
+#endif
+
+    // ctc::FindCollectionTypesEntryForCollection()
+    // Call with L"Start.TileGrid" to get ctc::Create_StartTileGridCollectionInitializer() & ctc::Create_StartTileGridCollection()
+    PBYTE matchFindCollectionTypesEntryForCollection = nullptr;
+#if defined(_M_X64)
+    // 49 8B ?? 48 8D 4D ?? E8 ?? ?? ?? ?? 48 8B C8 E8 ?? ?? ?? ?? 48 85 C0
+    //                                                 ^^^^^^^^^^^
+    // Ref: ctc::CuratedTileCollectionManager::GetCollectionForCollectionName()
+    matchFindCollectionTypesEntryForCollection = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x49\x8B\x00\x48\x8D\x4D\x00\xE8\x00\x00\x00\x00\x48\x8B\xC8\xE8\x00\x00\x00\x00\x48\x85\xC0",
+        "xx?xxx?x????xxxx????xxx"
+    );
+    if (matchFindCollectionTypesEntryForCollection)
+    {
+        matchFindCollectionTypesEntryForCollection += 15;
+        matchFindCollectionTypesEntryForCollection += 5 + *(int*)(matchFindCollectionTypesEntryForCollection + 1);
+    }
+#elif defined(_M_ARM64)
+    // FD 7B ?? A9 FD 03 00 91 ?? 03 00 AA ?? 03 01 AA E1 03 02 AA E0 ?? 00 91 ?? ?? ?? ?? ?? ?? ?? ??
+    //                                                                                     ^^^^^^^^^^^
+    // Ref: ctc::CuratedTileCollectionManager::GetInitializerForCollectionName()
+    matchFindCollectionTypesEntryForCollection = (PBYTE)FindPatternBitMask_4_(
+        pText, cbText,
+        "\xFD\x7B\x00\xA9\xFD\x03\x00\x91\x00\x03\x00\xAA\x00\x03\x01\xAA\xE1\x03\x02\xAA\xE0\x00\x00\x91\x00\x00\x00\x94\x00\x00\x00\x94",
+        "\xFF\xFF\x00\xFF\xFF\xFF\xFF\xFF\x00\xFF\xFF\xFF\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\xFF\xFF\x00\x00\x00\xFC\x00\x00\x00\xFC",
+        32
+    );
+    if (matchFindCollectionTypesEntryForCollection)
+    {
+        matchFindCollectionTypesEntryForCollection += 28;
+        matchFindCollectionTypesEntryForCollection = (PBYTE)ARM64_FollowBL((DWORD*)matchFindCollectionTypesEntryForCollection);
+    }
+#endif
+
+    // Concurrency::details::_Task_impl_base::_Wait()
+    PBYTE matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl = nullptr;
+    PBYTE matchConcurrencyTaskImplWait = nullptr;
+#if defined(_M_X64)
+    // 16299~
+    // 45 85 C0 78 ?? 48 8B 49 08 48 85 C9 75 06 E8 ?? ?? ?? ?? CC E8 ?? ?? ?? ??
+    //                                                                ^^^^^^^^^^^
+    // Ref: ctc::TransformerHelpers::BatchAction()
+    //      -> MakeAsyncAction() lambda
+    PBYTE matchConcurrencyTaskWait2x = (PBYTE)FindPattern(
+        pText, cbText,
+        "\x45\x85\xC0\x78\x00\x48\x8B\x49\x08\x48\x85\xC9\x75\x06\xE8\x00\x00\x00\x00\xCC\xE8",
+        "xxxx?xxxxxxxxxx????xx"
+    );
+    if (matchConcurrencyTaskWait2x)
+    {
+        matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl = matchConcurrencyTaskWait2x + 14;
+        matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl += 5 + *(int*)(matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl + 1);
+
+        matchConcurrencyTaskImplWait = matchConcurrencyTaskWait2x + 20;
+        matchConcurrencyTaskImplWait += 5 + *(int*)(matchConcurrencyTaskImplWait + 1);
+    }
+#elif defined(_M_ARM64)
+    // C2 00 F8 37 00 04 40 F9 40 00 00 B5 ?? ?? ?? ?? ?? ?? ?? ?? 02 00 80 52
+    //                                                 ^^^^^^^^^^^
+    // Ref: ctc::TransformerHelpers::BatchAction()
+    //      -> MakeAsyncAction() lambda
+    PBYTE matchConcurrencyTaskWait2x = (PBYTE)FindPattern_4_(
+        pText, cbText,
+        "\xC2\x00\xF8\x37\x00\x04\x40\xF9\x40\x00\x00\xB5\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x80\x52",
+        "xxxxxxxxxxxx????????xxxx"
+    );
+    if (matchConcurrencyTaskWait2x)
+    {
+        matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl = matchConcurrencyTaskWait2x + 12;
+        matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl = (PBYTE)ARM64_FollowBL((DWORD*)matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl);
+
+        matchConcurrencyTaskImplWait = matchConcurrencyTaskWait2x + 16;
+        matchConcurrencyTaskImplWait = (PBYTE)ARM64_FollowBL((DWORD*)matchConcurrencyTaskImplWait);
+    }
+#endif
+
+    RETURN_HR_IF_NULL(E_NOT_SET, matchMakeAndInitialize_CDSStartCollectionWriter);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchCreateLayoutInitializationLayoutRoot);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchMakeAndInitialize_CDSLayoutProvider);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchMakeShared_LayoutRootInternal);
+    // RETURN_HR_IF_NULL(E_NOT_SET, matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchLogAllTilesActivity_Dtor);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchFindCollectionTypesEntryForCollection);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl);
+    RETURN_HR_IF_NULL(E_NOT_SET, matchConcurrencyTaskImplWait);
+
+    WCHAR szPath[MAX_PATH];
+    RETURN_IF_FAILED(SHGetFolderPathW(nullptr, SPECIAL_FOLDER, nullptr, SHGFP_TYPE_CURRENT, szPath));
+    RETURN_IF_FAILED(StringCchCatW(szPath, ARRAYSIZE(szPath), _T(APP_RELATIVE_PATH) L"\\ep_starttiledata.dll"));
+
+    wil::unique_hmodule hMyStartTileData(LoadLibraryW(szPath));
+    RETURN_LAST_ERROR_IF_NULL(hMyStartTileData);
+
+    g_ctc_MakeAndInitialize_CDSStartCollectionWriter_Func = matchMakeAndInitialize_CDSStartCollectionWriter;
+    void* pfnMakeAndInitialize_CDSStartCollectionWriter = GetProcAddress(hMyStartTileData.get(), "??$MakeAndInitialize@VCDSStartCollectionWriter@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@UICollectionWriter@2345@AEAV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@_NAEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@8@@Details@WRL@Microsoft@@YAJPEAPEAUICollectionWriter@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@AEAV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@$$QEA_NAEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@9@@Z");
+    RETURN_LAST_ERROR_IF_NULL(pfnMakeAndInitialize_CDSStartCollectionWriter);
+
+    g_ctc_CreateLayoutInitializationLayoutRoot_Func = matchCreateLayoutInitializationLayoutRoot;
+    void* pfnCreateLayoutInitializationLayoutRoot = GetProcAddress(hMyStartTileData.get(), "?CreateLayoutInitializationLayoutRoot@LayoutRoot@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@SA?AV?$shared_ptr@ULayoutRoot@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@AEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@8@@Z");
+    RETURN_LAST_ERROR_IF_NULL(pfnCreateLayoutInitializationLayoutRoot);
+
+    g_ctc_MakeAndInitialize_CDSLayoutProvider_Func = matchMakeAndInitialize_CDSLayoutProvider;
+    void* pfnMakeAndInitialize_CDSLayoutProvider = GetProcAddress(hMyStartTileData.get(), "??$MakeAndInitialize@VCDSLayoutProvider@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@UIInitialCollectionProvider@2345@AEAY0P@$$CBGAEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@@Details@WRL@Microsoft@@YAJPEAPEAUIInitialCollectionProvider@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@AEAY0P@$$CBGAEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@@Z");
+    RETURN_LAST_ERROR_IF_NULL(pfnMakeAndInitialize_CDSLayoutProvider);
+
+    void* pfnMakeShared_LayoutRootInternal = nullptr;
+    void* pvtblRefCountObj2LayoutRootInternal = nullptr;
+    // void* pfnLayoutRootInternal_CtorWithTransformerRoot = nullptr;
+    if (!bIsInlined_MakeShared_LayoutRootInternal)
+    {
+        g_ctc_MakeShared_LayoutRootInternal_Func = matchMakeShared_LayoutRootInternal;
+        pfnMakeShared_LayoutRootInternal = GetProcAddress(hMyStartTileData.get(), "??$make_shared@VLayoutRootInternal@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@AEAV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@V?$shared_ptr@VCuratedRoot@CuratedTileCollectionTransformer@DataStoreCache@@@8@@std@@YA?AV?$shared_ptr@VLayoutRootInternal@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@0@AEAV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@0@$$QEAV?$shared_ptr@VCuratedRoot@CuratedTileCollectionTransformer@DataStoreCache@@@0@@Z");
+        RETURN_LAST_ERROR_IF_NULL(pfnMakeShared_LayoutRootInternal);
+    }
+    else
+    {
+        pvtblRefCountObj2LayoutRootInternal = GetProcAddress(hMyStartTileData.get(), "??_7?$_Ref_count_obj2@VLayoutRootInternal@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@6B@");
+        RETURN_LAST_ERROR_IF_NULL(pvtblRefCountObj2LayoutRootInternal);
+
+        g_ctc_LayoutRootInternal_CtorWithTransformerRoot_Func = (decltype(g_ctc_LayoutRootInternal_CtorWithTransformerRoot_Func))matchLayoutRootInternal_CtorWithTransformerRoot;
+        g_pfnLayoutRootInternal_CtorWithTransformerRoot = (decltype(g_pfnLayoutRootInternal_CtorWithTransformerRoot))GetProcAddress(hMyStartTileData.get(), "??0LayoutRootInternal@Internal@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@QEAA@AEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@V?$shared_ptr@VCuratedRoot@CuratedTileCollectionTransformer@DataStoreCache@@@7@@Z");
+        RETURN_LAST_ERROR_IF_NULL(g_pfnLayoutRootInternal_CtorWithTransformerRoot);
+    }
+
+    // g_ctc_MakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor_Func = matchMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor;
+    // void* pfnMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor = GetProcAddress(hMyStartTileData.get(), "??$MakeAndInitializeOrThrow@VWin8LayoutMigrationPostProcessor@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@AEAPEAUHSTRING__@@AEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@@wil@@YA?AV?$ComPtr@VWin8LayoutMigrationPostProcessor@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@WRL@Microsoft@@AEAPEAUHSTRING__@@AEBV?$shared_ptr@UCollectionContext@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@@std@@@Z");
+    // RETURN_LAST_ERROR_IF_NULL(pfnMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor);
+
+    void* pfnCreate_StartTileGridCollection = GetProcAddress(hMyStartTileData.get(), "?Create_StartTileGridCollection@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@@YA?AV?$com_ptr_t@UICuratedTileCollection@CuratedTileCollections@UnifiedTile@Shell@WindowsInternal@ABI@@Uerr_exception_policy@wil@@@wil@@W4CuratedTileCollectionOptionsInternal@1234@PEAUIUser@System@Windows@ABI@@@Z");
+    RETURN_LAST_ERROR_IF_NULL(pfnCreate_StartTileGridCollection);
+
+    void** ppfnLogAllTilesActivity_Dtor = (void**)GetProcAddress(hMyStartTileData.get(), "g_pfnLogAllTilesActivity_Dtor");
+    RETURN_LAST_ERROR_IF_NULL(ppfnLogAllTilesActivity_Dtor);
+
+    void** ppfnCreate_StartTileGridCollectionInitializer = (void**)GetProcAddress(hMyStartTileData.get(), "g_pfnCreate_StartTileGridCollectionInitializer");
+    RETURN_LAST_ERROR_IF_NULL(ppfnCreate_StartTileGridCollectionInitializer);
+
+    void** ppfnConcurrency__details___DefaultTaskHelper___NoCallOnDefaultTask_ErrorImpl = (void**)GetProcAddress(hMyStartTileData.get(), "g_pfnConcurrency__details___DefaultTaskHelper___NoCallOnDefaultTask_ErrorImpl");
+    RETURN_LAST_ERROR_IF_NULL(ppfnConcurrency__details___DefaultTaskHelper___NoCallOnDefaultTask_ErrorImpl);
+
+    void** ppfnConcurrency__details___Task_impl_base___Wait = (void**)GetProcAddress(hMyStartTileData.get(), "g_pfnConcurrency__details___Task_impl_base___Wait");
+    RETURN_LAST_ERROR_IF_NULL(ppfnConcurrency__details___Task_impl_base___Wait);
+
+    struct CollectionAssociatedTypes
+    {
+        void* pfnCreateInitializer;
+        void* pfnCreate;
+    };
+    using FindCollectionTypesEntryForCollection_t = const CollectionAssociatedTypes* (*)(std::wstring);
+    auto pfnFindCollectionTypesEntryForCollection = reinterpret_cast<FindCollectionTypesEntryForCollection_t>(matchFindCollectionTypesEntryForCollection);
+    const CollectionAssociatedTypes* typesStartTileGrid;
+    try
+    {
+        typesStartTileGrid = pfnFindCollectionTypesEntryForCollection(L"Start.TileGrid");
+    } CATCH_RETURN()
+    RETURN_HR_IF_NULL(E_NOT_SET, typesStartTileGrid);
+    RETURN_HR_IF_NULL(E_NOT_SET, typesStartTileGrid->pfnCreateInitializer);
+    RETURN_HR_IF_NULL(E_NOT_SET, typesStartTileGrid->pfnCreate);
+
+    g_ctc_Create_StartTileGridCollection = typesStartTileGrid->pfnCreate;
+
+    BYTE rdADRP_MakeShared_LayoutRootInternal = 0;
+    BYTE rdADD_MakeShared_LayoutRootInternal = 0;
+    BYTE rnADD_MakeShared_LayoutRootInternal = 0;
+    DWORD insnADRPNew_MakeShared_LayoutRootInternal = 0;
+    DWORD insnADDNew_MakeShared_LayoutRootInternal = 0;
+    if (bIsInlined_MakeShared_LayoutRootInternal)
+    {
+#if defined(_M_X64)
+        return E_UNEXPECTED;
+#elif defined(_M_ARM64)
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW), ARM64_DecodeADRLEx(
+            (UINT_PTR)(matchMakeShared_LayoutRootInternal + 16), *(DWORD*)(matchMakeShared_LayoutRootInternal + 16),
+            *(DWORD*)(matchMakeShared_LayoutRootInternal + 20), &rdADRP_MakeShared_LayoutRootInternal,
+            &rdADD_MakeShared_LayoutRootInternal, &rnADD_MakeShared_LayoutRootInternal) == 0);
+        RETURN_HR_IF(E_UNEXPECTED, rdADRP_MakeShared_LayoutRootInternal != rnADD_MakeShared_LayoutRootInternal);
+        RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW), !ARM64_EncodeADRL(
+            (UINT_PTR)(matchMakeShared_LayoutRootInternal + 16), (UINT_PTR)pvtblRefCountObj2LayoutRootInternal,
+            rdADRP_MakeShared_LayoutRootInternal, rdADD_MakeShared_LayoutRootInternal,
+            &insnADRPNew_MakeShared_LayoutRootInternal, &insnADDNew_MakeShared_LayoutRootInternal));
+#endif
+    }
+
+    RETURN_IF_FAILED(SlimDetoursTransactionBegin());
+    auto abortOnFailure = wil::scope_exit([] { LOG_IF_FAILED(SlimDetoursTransactionAbort()); });
+
+    RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_MakeAndInitialize_CDSStartCollectionWriter_Func, pfnMakeAndInitialize_CDSStartCollectionWriter));
+    RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_CreateLayoutInitializationLayoutRoot_Func, pfnCreateLayoutInitializationLayoutRoot));
+    RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_MakeAndInitialize_CDSLayoutProvider_Func, pfnMakeAndInitialize_CDSLayoutProvider));
+    // RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_MakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor_Func, pfnMakeAndInitializeOrThrow_Win8LayoutMigrationPostProcessor));
+    if (!bIsInlined_MakeShared_LayoutRootInternal)
+    {
+        RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_MakeShared_LayoutRootInternal_Func, pfnMakeShared_LayoutRootInternal));
+    }
+    else
+    {
+        RETURN_IF_FAILED(SlimDetoursAttach((void**)&g_ctc_LayoutRootInternal_CtorWithTransformerRoot_Func, ctc_LayoutRootInternal_CtorWithTransformerRoot_Hook));
+    }
+    RETURN_IF_FAILED(SlimDetoursAttach(&g_ctc_Create_StartTileGridCollection, pfnCreate_StartTileGridCollection));
+    *ppfnLogAllTilesActivity_Dtor = matchLogAllTilesActivity_Dtor;
+    *ppfnCreate_StartTileGridCollectionInitializer = typesStartTileGrid->pfnCreateInitializer;
+    *ppfnConcurrency__details___DefaultTaskHelper___NoCallOnDefaultTask_ErrorImpl = matchConcurrencyDefaultTaskHelperNoCallOnDefaultTaskErrorImpl;
+    *ppfnConcurrency__details___Task_impl_base___Wait = matchConcurrencyTaskImplWait;
+
+    RETURN_IF_FAILED(SlimDetoursTransactionCommit());
+
+    abortOnFailure.release();
+    hMyStartTileData.release();
+    return S_OK;
+}
+
 extern "C" {
 
 void PatchStartTileDataFurther(HMODULE hModule, BOOL bSMEH)
@@ -1271,10 +2003,114 @@ void PatchStartTileDataFurther(HMODULE hModule, BOOL bSMEH)
     // if (bSMEH)
         // pPinnableSurfaceFactory->AddRef(); // Pin in memory so that StartTileData.dll doesn't get unloaded
 
-    PatchUnifiedTilePinUnpinProvider(hModule);
+    if (bSMEH
+        && ((global_rovi.dwBuildNumber >= 22621 && global_rovi.dwBuildNumber <= 22635) && global_ubr >= 3420
+            || global_rovi.dwBuildNumber >= 25169))
+    {
+        PatchUnifiedTilePinUnpinProvider(hModule);
+    }
+
+    // Although this patch works with 11 Start, allow this to be disabled when 10 Start is not in use,
+    // in case it crashloops explorer. But Explorer needs to be restarted to take full effect.
+    if (dwStartShowClassicMode)
+    {
+        BringBackSharedStartLayoutInCuratedTileCollections(hModule);
+    }
 }
 
 } // extern "C"
+
+class StartPinUnpinContextMenuWrapper final
+    : public RuntimeClass<RuntimeClassFlags<ClassicCom>
+        , IContextMenu
+        , IShellExtInit
+        , IObjectWithSite
+    >
+{
+public:
+    HRESULT RuntimeClassInitialize(IContextMenu* pStock, IContextMenu* pCustom);
+
+    //~ Begin IContextMenu Interface
+    STDMETHODIMP QueryContextMenu(HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags) override;
+    STDMETHODIMP InvokeCommand(CMINVOKECOMMANDINFO* pici) override;
+    STDMETHODIMP GetCommandString(UINT_PTR idCmd, UINT uFlags, UINT* pwReserved, LPSTR pszName, UINT cchMax) override;
+    //~ End IContextMenu Interface
+
+    //~ Begin IShellExtInit Interface
+    STDMETHODIMP Initialize(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pDataObj, HKEY hKeyProgID) override;
+    //~ End IShellExtInit Interface
+
+    //~ Begin IObjectWithSite Interface
+    STDMETHODIMP SetSite(IUnknown* punkSite) override;
+    STDMETHODIMP GetSite(REFIID riid, void** ppvSite) override;
+    //~ End IObjectWithSite Interface
+
+    ComPtr<IContextMenu> _spStock;
+    ComPtr<IContextMenu> _spCustom;
+};
+
+HRESULT StartPinUnpinContextMenuWrapper::RuntimeClassInitialize(IContextMenu* pStock, IContextMenu* pCustom)
+{
+    _spStock = pStock;
+    _spCustom = pCustom;
+    return S_OK;
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::QueryContextMenu(
+    HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags)
+{
+    return (dwStartShowClassicMode ? _spCustom : _spStock)->QueryContextMenu(
+        hmenu, indexMenu, idCmdFirst, idCmdLast, uFlags);
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::InvokeCommand(CMINVOKECOMMANDINFO* pici)
+{
+    return (dwStartShowClassicMode ? _spCustom : _spStock)->InvokeCommand(pici);
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::GetCommandString(
+    UINT_PTR idCmd, UINT uFlags, UINT* pwReserved, LPSTR pszName, UINT cchMax)
+{
+    return (dwStartShowClassicMode ? _spCustom : _spStock)->GetCommandString(
+        idCmd, uFlags, pwReserved, pszName, cchMax);
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::Initialize(LPCITEMIDLIST pidlFolder, IDataObject* pDataObj, HKEY hKeyProgID)
+{
+    {
+        ComPtr<IShellExtInit> spStockInit;
+        RETURN_IF_FAILED(_spStock.As(&spStockInit));
+        RETURN_IF_FAILED(spStockInit->Initialize(pidlFolder, pDataObj, hKeyProgID));
+    }
+    {
+        ComPtr<IShellExtInit> spCustomInit;
+        RETURN_IF_FAILED(_spCustom.As(&spCustomInit));
+        RETURN_IF_FAILED(spCustomInit->Initialize(pidlFolder, pDataObj, hKeyProgID));
+    }
+    return S_OK;
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::GetSite(const IID& riid, void** ppvSite)
+{
+    ComPtr<IObjectWithSite> spStockSite;
+    RETURN_IF_FAILED(_spStock.As(&spStockSite));
+    return spStockSite->GetSite(riid, ppvSite);
+}
+
+HRESULT StartPinUnpinContextMenuWrapper::SetSite(IUnknown* punkSite)
+{
+    {
+        ComPtr<IObjectWithSite> spStockSite;
+        RETURN_IF_FAILED(_spStock.As(&spStockSite));
+        RETURN_IF_FAILED(spStockSite->SetSite(punkSite));
+    }
+    {
+        ComPtr<IObjectWithSite> spCustomSite;
+        RETURN_IF_FAILED(_spCustom.As(&spCustomSite));
+        RETURN_IF_FAILED(spCustomSite->SetSite(punkSite));
+    }
+    return S_OK;
+}
 
 struct CCacheShortcut
 {
@@ -1288,8 +2124,57 @@ struct CCacheShortcut
 extern "C"
 {
 
-HRESULT(*AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStartFunc)(void* _this, const CCacheShortcut* a2, const void* a3);
-HRESULT AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStart(void* _this, const CCacheShortcut* a2, const void* a3)
+class DECLSPEC_UUID("470c0ebd-5d73-4d58-9ced-e91e22e23282")
+StartPinUnpinContextMenu;
+
+HRESULT (STDMETHODCALLTYPE *StartPinUnpinContextMenu_CreateInstance_IClassFactory_Func)(
+    IClassFactory* This, IUnknown* pUnkOuter, REFIID riid, void** ppvObject);
+HRESULT STDMETHODCALLTYPE StartPinUnpinContextMenu_CreateInstance_IClassFactory_Hook(
+    IClassFactory* This, IUnknown* pUnkOuter, REFIID riid, void** ppvObject)
+{
+    WCHAR szPath[MAX_PATH];
+    RETURN_IF_FAILED(SHGetFolderPathW(nullptr, SPECIAL_FOLDER, nullptr, SHGFP_TYPE_CURRENT, szPath));
+    RETURN_IF_FAILED(StringCchCatW(szPath, ARRAYSIZE(szPath), _T(APP_RELATIVE_PATH) L"\\ep_starttiledata.dll"));
+
+    wil::unique_hmodule hMyStartTileData(LoadLibraryW(szPath));
+    RETURN_LAST_ERROR_IF_NULL(hMyStartTileData);
+
+    auto pfnDllGetClassObject = (decltype(&DllGetClassObject))GetProcAddress(hMyStartTileData.get(), "DllGetClassObject");
+    RETURN_LAST_ERROR_IF_NULL(pfnDllGetClassObject);
+
+    ComPtr<IClassFactory> spFactory;
+    RETURN_IF_FAILED(pfnDllGetClassObject(__uuidof(StartPinUnpinContextMenu), IID_PPV_ARGS(&spFactory)));
+
+    ComPtr<IContextMenu> spCustomCM;
+    RETURN_IF_FAILED(spFactory->CreateInstance(pUnkOuter, IID_PPV_ARGS(&spCustomCM)));
+
+    ComPtr<IContextMenu> spStockCM;
+    RETURN_IF_FAILED(StartPinUnpinContextMenu_CreateInstance_IClassFactory_Func(This, pUnkOuter, IID_PPV_ARGS(&spStockCM)));
+
+    ComPtr<StartPinUnpinContextMenuWrapper> spWrapper;
+    RETURN_IF_FAILED(MakeAndInitialize<StartPinUnpinContextMenuWrapper>(&spWrapper, spStockCM.Get(), spCustomCM.Get()));
+    RETURN_IF_FAILED(spWrapper.CopyTo(riid, ppvObject));
+
+    hMyStartTileData.release();
+    return S_OK;
+}
+
+extern HRESULT PatchAppResolver_PatchStartPinUnpinContextMenu(HMODULE hAppResolver)
+{
+    auto pfnDllGetClassObject = (decltype(&DllGetClassObject))GetProcAddress(hAppResolver, "DllGetClassObject");
+    RETURN_LAST_ERROR_IF_NULL(pfnDllGetClassObject);
+
+    ComPtr<IClassFactory> spFactory;
+    RETURN_IF_FAILED(pfnDllGetClassObject(__uuidof(StartPinUnpinContextMenu), IID_PPV_ARGS(&spFactory)));
+
+    void** vtable = *(void***)spFactory.Get();
+    REPLACE_VTABLE_ENTRY(vtable, 3, StartPinUnpinContextMenu_CreateInstance_IClassFactory_);
+
+    return S_OK;
+}
+
+HRESULT (__thiscall *AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStartFunc)(void* _this, const CCacheShortcut* a2, const void* a3);
+HRESULT __thiscall AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStart(void* _this, const CCacheShortcut* a2, const void* a3)
 {
     using namespace ABI::WindowsInternal::Shell::UnifiedTile;
     using namespace ABI::WindowsInternal::Shell::UnifiedTile::Private;

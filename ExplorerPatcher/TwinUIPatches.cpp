@@ -380,7 +380,6 @@ extern DWORD bNoMenuAccelerator;
 extern DWORD dwAltTabSettings;
 extern DWORD dwSnapAssistSettings;
 extern DWORD dwStartShowClassicMode;
-extern HANDLE hWin11AltTabInitialized;
 
 typedef HRESULT(*ImmersiveContextMenuHelper_ApplyOwnerDrawToMenu_t)(HMENU hmenu, HWND hWnd, POINT* pptOrigin, unsigned int icmoFlags, void* srgRenderingData);
 extern ImmersiveContextMenuHelper_ApplyOwnerDrawToMenu_t ImmersiveContextMenuHelper_ApplyOwnerDrawToMenuFunc;
@@ -1002,13 +1001,6 @@ LSTATUS twinuipcshell_RegGetValueW(
             }
         }
 
-        if (!bOldTaskbar && hWin11AltTabInitialized)
-        {
-            SetEvent(hWin11AltTabInitialized);
-            CloseHandle(hWin11AltTabInitialized);
-            hWin11AltTabInitialized = nullptr;
-        }
-
         lRes = ERROR_SUCCESS;
     }
 
@@ -1533,6 +1525,7 @@ BOOL Moment2PatchHardwareConfirmator(HMODULE hHardwareConfirmator, PBYTE pSearch
     {
         cleanupBegin = match2 + 17;
         cleanupEnd = match2 + 38; // Exclusive
+        if (cleanupBegin >= pSearchBegin + cbSearch || cleanupEnd >= pSearchBegin + cbSearch) return FALSE;
         printf("[HC] cleanup = %llX-%llX\n", cleanupBegin - (PBYTE)hHardwareConfirmator, cleanupEnd - (PBYTE)hHardwareConfirmator);
         if (*cleanupBegin != 0x49 || *cleanupEnd != 0x90 /*Already NOP here*/) return FALSE;
     }
@@ -1553,6 +1546,7 @@ BOOL Moment2PatchHardwareConfirmator(HMODULE hHardwareConfirmator, PBYTE pSearch
     // Execution
     DWORD dwOldProtect = 0;
     SIZE_T totalSize = sizeof(shellcode) + 5;
+    if (writeAt + totalSize >= pSearchBegin + cbSearch) return FALSE;
     if (!VirtualProtect(writeAt, totalSize, PAGE_EXECUTE_READWRITE, &dwOldProtect)) return FALSE;
     memcpy(writeAt, shellcode, sizeof(shellcode));
     PBYTE jmpLoc = writeAt + sizeof(shellcode);
@@ -1826,6 +1820,74 @@ HRESULT CStartExperienceManager_OnViewHiddenHook(void* eventHandler, CSingleView
     return CStartExperienceManager_OnViewHiddenFunc(eventHandler, pSender);
 }
 
+struct StartMenuAnimationHidePatch
+{
+    // Please initialize all fields in FixStartMenuAnimation()
+
+    PBYTE _pSite1;
+    PBYTE _pSite2;
+#if defined(_M_X64)
+    BYTE _rgOriginalSite1[12];
+    BYTE _rgOriginalSite2[12];
+#elif defined(_M_ARM64)
+    BYTE _rgOriginalSite1[8];
+    BYTE _rgOriginalSite2[8];
+#endif
+
+    void ApplyOrRevert(bool bApply) const
+    {
+        if (_pSite1 != nullptr && _pSite2 != nullptr)
+        {
+            if (bApply)
+            {
+                ApplyForOne(_pSite1);
+                ApplyForOne(_pSite2);
+            }
+            else
+            {
+                RevertForOne(_pSite1, _rgOriginalSite1, sizeof(_rgOriginalSite1));
+                RevertForOne(_pSite2, _rgOriginalSite2, sizeof(_rgOriginalSite2));
+            }
+        }
+    }
+
+private:
+    static void ApplyForOne(PBYTE pTarget)
+    {
+#if defined(_M_X64)
+        DWORD dwOldProtect;
+        if (VirtualProtect(pTarget, 12, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            memset(pTarget, 0x90, 12); // nop
+            VirtualProtect(pTarget, 12, dwOldProtect, &dwOldProtect);
+        }
+#elif defined(_M_ARM64)
+        DWORD dwOldProtect;
+        if (VirtualProtect(pTarget, 8, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            *(DWORD*)(pTarget + 0) = 0xD503201F; // NOP
+            *(DWORD*)(pTarget + 4) = 0xD503201F; // NOP
+            VirtualProtect(pTarget, 8, dwOldProtect, &dwOldProtect);
+        }
+#endif
+    }
+
+    static void RevertForOne(PBYTE pTarget, const void* pOriginalBytes, size_t cbOriginalBytes)
+    {
+        DWORD dwOldProtect;
+        if (VirtualProtect(pTarget, cbOriginalBytes, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            memcpy(pTarget, pOriginalBytes, cbOriginalBytes);
+            VirtualProtect(pTarget, cbOriginalBytes, dwOldProtect, &dwOldProtect);
+        }
+    }
+} g_StartMenuAnimationHidePatch = {};
+
+EXTERN_C void StartMenuAnimationHidePatch_ApplyOrRevert(BOOL bApply)
+{
+    g_StartMenuAnimationHidePatch.ApplyOrRevert(bApply != 0);
+}
+
 BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cbSearch)
 {
     if (!pSearchBegin || !cbSearch)
@@ -1933,7 +1995,15 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
     );
     if (matchSingleViewShellExperienceFields)
     {
-        g_SMAnimationPatchOffsets.startExperienceManager_singleViewShellExperience = (int)ARM64_DecodeADD(*(DWORD*)(matchSingleViewShellExperienceFields + 8));
+        DWORD insnADD = ARM64_DecodeADD(*(DWORD*)(matchSingleViewShellExperienceFields + 8));
+        if (insnADD != 0)
+        {
+            g_SMAnimationPatchOffsets.startExperienceManager_singleViewShellExperience = (int)insnADD;
+        }
+        else
+        {
+            matchSingleViewShellExperienceFields = nullptr;
+        }
     }
 #endif
     if (matchSingleViewShellExperienceFields)
@@ -2365,15 +2435,6 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
             printf("[SMA] matchHideB in CStartExperienceManager::Hide() = %llX\n", matchHideB - (PBYTE)hTwinuiPcshell);
         }
     }
-    auto hide_doForOne = [](PBYTE pTarget) -> void
-    {
-        DWORD dwOldProtect;
-        if (VirtualProtect(pTarget, 12, PAGE_EXECUTE_READWRITE, &dwOldProtect))
-        {
-            memset(pTarget, 0x90, 12); // nop
-            VirtualProtect(pTarget, 12, dwOldProtect, &dwOldProtect);
-        }
-    };
 #elif defined(_M_ARM64)
     // Find for nop targets:
     //   MOV             W??, #3
@@ -2383,9 +2444,10 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
     //     22000.2899 0011100100_001010001011_10101_11011
     //     22621.1918 0011100100_001010100011_10011_11011
     //     26100.5551 0011100100_001011010011_10100_11010
+    //     28000.2149 0011100100_001011010011_11001_10100
     //     29553.1000 0011100100_001011010011_10101_10100
     //     P:         0011100100_001010000011_10000_10000 = 390A0E10 = 10 0E 0A 39
-    //     M:         1111111111_111110000111_11000_10000 = FFFE1F10 = 10 1F FE FF
+    //     M:         1111111111_111110000111_10000_10000 = FFFE1E10 = 10 1E FE FF
     // Nop if followed by a Hide() call
     //   E1 03 ?? 2A ?? ?? 04 91 ?? ?? ?? ?? ?? 03 00 2A
     // Perform on exactly two matches
@@ -2395,7 +2457,7 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
             pBegin,
             cbSearch,
             "\x60\x00\x80\x52\x10\x0E\x0A\x39",
-            "\xE0\xFF\xFF\xFF\x10\x1F\xFE\xFF",
+            "\xE0\xFF\xFF\xFF\x10\x1E\xFE\xFF",
             8
         );
         if (pMovStrb)
@@ -2436,16 +2498,6 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
             printf("[SMA] matchHideB in CStartExperienceManager::Hide() = %llX\n", matchHideB - (PBYTE)hTwinuiPcshell);
         }
     }
-    auto hide_doForOne = [](PBYTE pTarget) -> void
-    {
-        DWORD dwOldProtect;
-        if (VirtualProtect(pTarget, 8, PAGE_EXECUTE_READWRITE, &dwOldProtect))
-        {
-            *(DWORD*)(pTarget + 0) = 0xD503201F; // NOP
-            *(DWORD*)(pTarget + 4) = 0xD503201F; // NOP
-            VirtualProtect(pTarget, 8, dwOldProtect, &dwOldProtect);
-        }
-    };
 #endif
 
     if (!matchVtable
@@ -2468,11 +2520,11 @@ BOOL FixStartMenuAnimation(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t cb
     REPLACE_VTABLE_ENTRY(vtable, 6, CStartExperienceManager_OnViewCloaking);
     REPLACE_VTABLE_ENTRY(vtable, 10, CStartExperienceManager_OnViewHidden);
 
-    if (dwStartShowClassicMode)
-    {
-        hide_doForOne(matchHideA);
-        hide_doForOne(matchHideB);
-    }
+    g_StartMenuAnimationHidePatch._pSite1 = matchHideA;
+    g_StartMenuAnimationHidePatch._pSite2 = matchHideB;
+    memcpy(g_StartMenuAnimationHidePatch._rgOriginalSite1, matchHideA, sizeof(g_StartMenuAnimationHidePatch._rgOriginalSite1));
+    memcpy(g_StartMenuAnimationHidePatch._rgOriginalSite2, matchHideB, sizeof(g_StartMenuAnimationHidePatch._rgOriginalSite2));
+    g_StartMenuAnimationHidePatch.ApplyOrRevert(dwStartShowClassicMode != 0);
 
     int rv = -1;
     if (CStartExperienceManager_GetMonitorInformationFunc)
@@ -3051,9 +3103,17 @@ BOOL FixJumpViewPositioning(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t c
         );
         if (matchOffsetRcWorkArea)
         {
-            g_JVPositioningPatchOffsets.jumpViewExperienceManager_rcWorkArea = 0x40 + (int)ARM64_DecodeADD(*(DWORD*)(matchOffsetRcWorkArea + 8));
+            DWORD insnADD = ARM64_DecodeADD(*(DWORD*)(matchOffsetRcWorkArea + 8));
+            if (insnADD != 0)
+            {
+                g_JVPositioningPatchOffsets.jumpViewExperienceManager_rcWorkArea = 0x40 + (int)insnADD;
+            }
+            else
+            {
+                matchOffsetRcWorkArea = nullptr;
+            }
         }
-        if (!matchOffsetRcWorkArea)
+        else
         {
             // With Feature_TaskbarJumplistOnHover (48980211)
             // 61 3A 40 F9 22 01 03 32 67 32 07 91
@@ -3071,7 +3131,15 @@ BOOL FixJumpViewPositioning(HMODULE hTwinuiPcshell, PBYTE pSearchBegin, size_t c
             );
             if (matchOffsetRcWorkArea)
             {
-                g_JVPositioningPatchOffsets.jumpViewExperienceManager_rcWorkArea = 0x40 + (int)ARM64_DecodeADD(*(DWORD*)(matchOffsetRcWorkArea + 8));
+                DWORD insnADD = ARM64_DecodeADD(*(DWORD*)(matchOffsetRcWorkArea + 8));
+                if (insnADD != 0)
+                {
+                    g_JVPositioningPatchOffsets.jumpViewExperienceManager_rcWorkArea = 0x40 + (int)insnADD;
+                }
+                else
+                {
+                    matchOffsetRcWorkArea = nullptr;
+                }
             }
         }
     }
@@ -3727,8 +3795,7 @@ extern "C" void RunTwinUIPCShellPatches(symbols_addr* symbols_PTRS)
         }
     }
 
-    if ((global_rovi.dwBuildNumber > 22000 || global_rovi.dwBuildNumber == 22000 && global_ubr >= 65) // Allow on 22000.65+
-        && (bOldTaskbar || dwStartShowClassicMode))
+    if ((global_rovi.dwBuildNumber > 22000 || global_rovi.dwBuildNumber == 22000 && global_ubr >= 65) /*Allow on 22000.65+*/)
     {
         // Make sure crash counter is enabled. If one of the patches make Explorer crash while the start menu is open,
         // we don't want to softlock the user. The system reopens the start menu if Explorer terminates while it's open.

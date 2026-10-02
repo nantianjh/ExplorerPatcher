@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Print inputs
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           echo "ref: ${GITHUB_EVENT_INPUTS_REF}"
@@ -75,6 +76,7 @@ jobs:
       - name: Restore NuGet packages
         run: |
           nuget restore ExplorerPatcher.sln
+          nuget restore ep_starttiledata/ep_starttiledata.slnx
 
       - name: Build dependencies
         shell: cmd

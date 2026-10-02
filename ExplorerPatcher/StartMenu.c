@@ -574,6 +574,24 @@ static HRESULT STDMETHODCALLTYPE WindowsUdk_UI_Shell_ITaskbarSettings_GetLocatio
     DWORD* pLocation // Left Top Right Bottom
 )
 {
+    /*TVSD srd;
+    DWORD cbData = sizeof(TVSD);
+    RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRectsLegacy",
+        L"Settings",
+        REG_BINARY,
+        NULL,
+        &srd,
+        &cbData);
+    if (cbData == sizeof(TVSD) && srd.dwSize == sizeof(TVSD) && srd.lSignature == -2)
+    {
+        *pLocation = srd.uStuckPlace;
+    }
+    else
+    {
+        *pLocation = 3; // Bottom
+    }*/
     HWND hwndTray = FindWindowW(L"Shell_TrayWnd", NULL);
     if (hwndTray)
     {

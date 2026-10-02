@@ -4,15 +4,13 @@ This document includes the same release notes as in the [Releases](https://githu
 
 ## 26100.8457.70
 
-Tested on OS builds 22621.4317, 22631.7079, 26100.6899, 26100.8037, 26200.8246, 26200.8457, 26300.8493, and 28000.2113.
+Tested on OS builds 22621.4317 x64, 22631.7079 x64, 26100.6899 ARM64, 26200.8457 x64, 26300.8493 x64, 26300.8758 x64, 28000.2269 ARM64, and 29617.1000 x64.
 
 ##### 1
 
-* **🚨 Important: Fixed 10 taskbar and 10 Start menu crashing on 26220.8474 (Beta) and 26300.8493 (Experimental).**
-  * Please update EP as soon as possible to ensure future updates run smoothly, otherwise `explorer.exe` will not run with EP's 10 taskbar and `StartMenuExperienceHost.exe` will not run when 10 Start menu is selected.
-  * Those builds have removed remnants of the 10 Start menu in `StartTileData.dll`. Consequently, the 10 Start menu option has been removed on those builds and future builds without the required stuff in the DLL. (bf36cde, 8a5b8ba)
-    * If you want it back, the temporary solution would be to manually swap `C:\Windows\System32\StartTileData.dll` with a version from 26xxx.8457 ([x64](https://msdl.microsoft.com/download/symbols/StartTileData.dll/AFC6C0B854F000/StartTileData.dll); [ARM64](https://msdl.microsoft.com/download/symbols/StartTileData.dll/600B7C42B7D000/StartTileData.dll)). But do not expect this to work for long.
-    * We are confident that this is not the end of the road yet for 10 Start menu. Stay tuned for updates.
+* **🚨 Important: Fixed 10 taskbar and 10 Start menu crashing on 26xxx.8474+ and 28xxx.2298+.**
+  * Due to 10 Start menu's tile layout engine being removed from `StartTileData.dll`, the 10 Start menu option has been temporarily hidden. (bf36cde, 8a5b8ba)
+  * *The 10 Start menu option has been made available again in version 70.2.*
 * **Highlight:** Fixed Windows 10 battery flyout crashing on 25951+. (659c2d0)
   * As a side effect, the network flyout buttons had to be reverted to pre-24H2. Fixes #4691.
 * Changes to "Primary taskbar location on screen" in EP properties now reflect immediately. (6c9b41d)
@@ -29,6 +27,32 @@ Tested on OS builds 22621.4317, 22631.7079, 26100.6899, 26100.8037, 26200.8246, 
 * Fixed reimplementation mistakes in system tray and some other places.
 * [For mod developers] Changed ep_taskbar's DLL names from numbers to the codename of the first major release a single variant supports. (cc36e34)
 * [For mod developers] TrayUI no longer inherits `Microsoft::WRL::RuntimeClass`; vtables are now stable on builds with multiple `ITrayUI` revisions like `ep_taskbar.ge.dll` (formerly `ep_taskbar.5.dll`).
+
+##### 2
+
+* Introduced a reimplemented 10 Start menu tile layout engine that was removed in 26xxx.8474. (688514f)
+  * *A full restoration has been introduced in version 70.4*.
+* Added an executable name blacklist to prevent shell extension from loading in certain applications. (#4819) (991b8ca)
+* Updated 10 Start menu animation patterns for 28xxx.2149+ ARM64. (c480fc2)
+
+**ep_taskbar:**
+* Fixed a deadlock relating to base EP reporting taskbar position and the taskbar reporting search/task view button location and size both to `WindowsUdk.ShellCommon.dll` during taskbar initialization.
+
+##### 3
+
+* Start10: Mitigated a new breakage related to removal of tablet mode code currently being rolled out on 25H2 Experimental builds 8553, 8687, 8697, and beyond. Thanks @AllieTheFox! (94cc68e)
+* Start10: Pinned tiles are no longer reset after 5 consecutive crashes. Thanks @AllieTheFox! (cc85aaf)
+* GUI: Fixed the wording of some strings. Thanks @Sefinek! (626ebf2)
+
+##### 4
+
+* Fixed 10 (EP) taskbar crashing on 28xxx.2298+ (26H1), x64 only. ARM64 is not affected. (#5063)
+* Restored 10 Start tile pinning behavior on 26xxx.8474+ and 28xxx.2298+. (96839ff, 0ecde00)
+* Fixed Explorer Pin to Start/Unpin from Start context menu action behavior when 10 Start is used on 226xx.3420+. (96839ff, 0ecde00)
+* Switching between 10 and 11 Start without restarting Explorer no longer results in broken open/close animation. (f022f50, 59a6a42)
+* Fixed properties dialog crash with [`hide-titlebar-elements`](https://windhawk.net/mods/hide-titlebar-elements) Windhawk mod. Thanks @ypx13 for the report and @AllieTheFox for the work! (0fad899)
+* Fixed Explorer crashlooping with [`file-explorer-content-animation`](https://windhawk.net/mods/file-explorer-content-animation) Windhawk mod. (#5098, 85e3d3a)
+* Fixed Simple Window Switcher not showing up when 11 taskbar is used. (#4982, 91bbc0e)
 
 ## 26100.4946.69
 

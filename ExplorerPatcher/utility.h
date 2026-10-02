@@ -66,12 +66,17 @@ DEFINE_GUID(CLSID_NetworkListManager,
 DEFINE_GUID(IID_NetworkListManager,
     0xDCB00000, 0x570F, 0x4A9B, 0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B);
 
-typedef struct _StuckRectsData
+typedef struct _TVSD
 {
-    int pvData[6];
-    RECT rc;
-    POINT pt;
-} StuckRectsData;
+    DWORD dwSize;
+    LONG lSignature;
+    DWORD dwFlags;
+    UINT uStuckPlace;
+    SIZE sStuckWidths;
+    RECT rcLastStuck;
+    UINT uLastDpi;
+    int iRowCount;
+} TVSD;
 
 HRESULT FindDesktopFolderView(REFIID riid, void** ppv);
 
@@ -1038,15 +1043,15 @@ inline BOOL FollowJmp(PBYTE pInstr, PBYTE* pTarget, DWORD* pInstrSize)
 
 __forceinline DWORD ARM64_ReadBits(DWORD value, int h, int l)
 {
-    return (value >> l) & ((1 << (h - l + 1)) - 1);
+    int bits = h - l + 1;
+    DWORD mask = bits == 32 ? 0xFFFFFFFF : ((1u << bits) - 1);
+    return (value >> l) & mask;
 }
 
 __forceinline int ARM64_SignExtend(DWORD value, int numBits)
 {
-    DWORD mask = 1 << (numBits - 1);
-    if (value & mask)
-        value |= ~((1 << numBits) - 1);
-    return (int)value;
+    DWORD mask = 1u << (numBits - 1);
+    return (int)((value ^ mask) - mask);
 }
 
 __forceinline int ARM64_ReadBitsSignExtend(DWORD insn, int h, int l)
@@ -1054,10 +1059,11 @@ __forceinline int ARM64_ReadBitsSignExtend(DWORD insn, int h, int l)
     return ARM64_SignExtend(ARM64_ReadBits(insn, h, l), h - l + 1);
 }
 
-__forceinline BOOL ARM64_IsInRange(int value, int bitCount)
+__forceinline BOOL ARM64_IsInRange(int value, int numBits)
 {
-    int minVal = -(1 << (bitCount - 1));
-    int maxVal = (1 << (bitCount - 1)) - 1;
+    UINT limit = 1u << (numBits - 1);
+    int minVal = -(int)limit;
+    int maxVal = (int)(limit - 1);
     return value >= minVal && value <= maxVal;
 }
 
@@ -1073,6 +1079,7 @@ __forceinline BOOL ARM64_IsTBNZ(DWORD insn) { return ARM64_ReadBits(insn, 31, 24
 __forceinline BOOL ARM64_IsB(DWORD insn) { return ARM64_ReadBits(insn, 31, 26) == 0b000101; }
 __forceinline BOOL ARM64_IsBL(DWORD insn) { return ARM64_ReadBits(insn, 31, 26) == 0b100101; }
 __forceinline BOOL ARM64_IsADRP(DWORD insn) { return (ARM64_ReadBits(insn, 31, 24) & ~0b01100000) == 0b10010000; }
+__forceinline BOOL ARM64_IsADDIMM(DWORD insn) { return (insn & 0x7F000000) == 0x11000000; } // Wn and Xn forms accepted
 __forceinline BOOL ARM64_IsMOVZW(DWORD insn) { return ARM64_ReadBits(insn, 31, 23) == 0b010100101; }
 __forceinline BOOL ARM64_IsSTRBIMM(DWORD insn) { return ARM64_ReadBits(insn, 31, 22) == 0b0011100100; }
 
@@ -1107,14 +1114,14 @@ __forceinline DWORD ARM64_MakeB(int imm26)
 {
     if (!ARM64_IsInRange(imm26, 26))
         return 0;
-    return 0b000101 << 26 | imm26 & (1 << 26) - 1;
+    return 0b000101u << 26 | (imm26 & (1u << 26) - 1);
 }
 
 __forceinline DWORD ARM64_MakeBL(int imm26)
 {
     if (!ARM64_IsInRange(imm26, 26))
         return 0;
-    return 0b100101 << 26 | imm26 & (1 << 26) - 1;
+    return 0b100101u << 26 | (imm26 & (1u << 26) - 1);
 }
 
 __forceinline DWORD ARM64_CBZWToB(DWORD insnCBZW)
@@ -1151,6 +1158,8 @@ __forceinline DWORD ARM64_TBNZToB(DWORD insnTBNZ)
 
 __forceinline DWORD ARM64_DecodeADD(DWORD insnADD)
 {
+    if (!ARM64_IsADDIMM(insnADD))
+        return 0;
     DWORD imm12 = ARM64_ReadBits(insnADD, 21, 10);
     DWORD shift = ARM64_ReadBits(insnADD, 22, 22);
     return imm12 << (shift * 12);
@@ -1180,20 +1189,97 @@ __forceinline DWORD ARM64_DecodeLDRIMMW(DWORD insnLDRIMMW)
     return imm12;
 }
 
-inline UINT_PTR ARM64_DecodeADRL(UINT_PTR offset, DWORD insnADRP, DWORD insnADD)
+inline UINT_PTR ARM64_DecodeADRLEx(
+    UINT_PTR offset, DWORD insnADRP, DWORD insnADD, BYTE* pRdADRP, BYTE* pRdADD, BYTE* pRnADD)
 {
     if (!ARM64_IsADRP(insnADRP))
         return 0;
+
+    if (pRdADRP)
+        *pRdADRP = (BYTE)ARM64_ReadBits(insnADRP, 4, 0);
+
+    if (pRdADD)
+        *pRdADD = (BYTE)ARM64_ReadBits(insnADD, 4, 0);
+
+    if (pRnADD)
+        *pRnADD = (BYTE)ARM64_ReadBits(insnADD, 9, 5);
 
     UINT_PTR page = ARM64_Align(offset, 0x1000);
 
     DWORD adrp_immlo = ARM64_ReadBits(insnADRP, 30, 29);
     DWORD adrp_immhi = ARM64_ReadBits(insnADRP, 23, 5);
-    DWORD adrp_imm = ((adrp_immhi << 2) | adrp_immlo) << 12;
+    INT_PTR adrp_imm = (INT_PTR)ARM64_SignExtend((adrp_immhi << 2) | adrp_immlo, 21) << 12;
 
     DWORD add_imm = ARM64_DecodeADD(insnADD);
+    if (add_imm == 0)
+        return 0;
 
     return page + adrp_imm + add_imm;
+}
+
+__forceinline UINT_PTR ARM64_DecodeADRL(UINT_PTR offset, DWORD insnADRP, DWORD insnADD)
+{
+    return ARM64_DecodeADRLEx(offset, insnADRP, insnADD, NULL, NULL, NULL);
+}
+
+__forceinline BOOL ARM64_EncodeADDIMMX(BYTE rd, BYTE rn, DWORD imm, DWORD* pinsnADD)
+{
+    DWORD shift;
+    DWORD imm12;
+
+    if (imm <= 0xFFF)
+    {
+        shift = 0;
+        imm12 = imm;
+    }
+    else if ((imm & 0xFFF) == 0 && imm <= (0xFFFu << 12))
+    {
+        shift = 1;
+        imm12 = imm >> 12;
+    }
+    else
+    {
+        return FALSE;
+    }
+
+    // ADD Xd, Xn, #imm
+    *pinsnADD = (1u << 31) /*sf = 1 (64-bit)*/ | (0b10001u << 24) /*opcode*/ | (shift << 22) | (imm12 << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F);
+
+    return TRUE;
+}
+
+__forceinline BOOL ARM64_EncodeADRP(UINT_PTR offset, UINT_PTR target, BYTE rd, DWORD* pinsnADRP)
+{
+    INT_PTR pageDelta = (INT_PTR)ARM64_Align(target, 0x1000) - (INT_PTR)ARM64_Align(offset, 0x1000);
+
+    INT_PTR imm21 = pageDelta >> 12;
+
+    if (!ARM64_IsInRange((int)imm21, 21))
+        return FALSE;
+
+    DWORD imm = (DWORD)imm21 & 0x1FFFFF;
+
+    DWORD immlo = imm & 0x3;
+    DWORD immhi = imm >> 2;
+
+    *pinsnADRP = (1u << 31) /*op = ADRP*/ | (immlo << 29) | (0b10000u << 24) | (immhi << 5) | (rd & 0x1F);
+
+    return TRUE;
+}
+
+__forceinline BOOL ARM64_EncodeADRL(
+    UINT_PTR offset, UINT_PTR target, BYTE rdADRP, BYTE rdADD, DWORD* pinsnADRP, DWORD* pinsnADD)
+{
+    UINT_PTR page = ARM64_Align(target, 0x1000);
+    DWORD pageOff = (DWORD)(target - page);
+
+    if (!ARM64_EncodeADRP(offset, target, rdADRP, pinsnADRP))
+        return FALSE;
+
+    if (!ARM64_EncodeADDIMMX(rdADD, rdADRP, pageOff, pinsnADD))
+        return FALSE;
+
+    return TRUE;
 }
 #endif
 
@@ -1394,6 +1480,36 @@ StartLayoutFactory;*/
 
 DEFINE_GUID(CLSID_StartLayoutFactory, 0x7BD7AB1C, 0xF2C5, 0x60C2, 0x8D, 0x00, 0xC2, 0xE5, 0x03, 0x36, 0xA9, 0x54);
 
+inline BOOL TestClsidExists(HMODULE hModule, REFCLSID rclsid)
+{
+    BOOL bRet = FALSE;
+
+    typedef HRESULT (WINAPI *DllGetClassObject_t)(REFCLSID rclsid, REFIID riid, LPVOID* ppv);
+    DllGetClassObject_t pfnDllGetClassObject = (DllGetClassObject_t)GetProcAddress(hModule, "DllGetClassObject");
+    if (pfnDllGetClassObject)
+    {
+#ifdef __cplusplus
+        IClassFactory* pFactory;
+        HRESULT hr = pfnDllGetClassObject(rclsid, IID_PPV_ARGS(&pFactory));
+        if (SUCCEEDED(hr))
+        {
+            bRet = TRUE;
+            pFactory->Release();
+        }
+#else
+        IClassFactory* pFactory;
+        HRESULT hr = pfnDllGetClassObject(rclsid, &IID_IClassFactory, (void**)&pFactory);
+        if (SUCCEEDED(hr))
+        {
+            bRet = TRUE;
+            pFactory->lpVtbl->Release(pFactory);
+        }
+#endif
+    }
+
+    return bRet;
+}
+
 inline BOOL DoesWindows10StartMenuExist()
 {
     static BOOL s_tbWindows10StartMenuExists; // UNDEFINED, TRUE, FALSE
@@ -1402,7 +1518,7 @@ inline BOOL DoesWindows10StartMenuExist()
         if (!IsWindows11())
         {
             s_tbWindows10StartMenuExists = 1;
-            return s_tbWindows10StartMenuExists;
+            return s_tbWindows10StartMenuExists == 1;
         }
 
         wchar_t szPath[MAX_PATH];
@@ -1423,28 +1539,26 @@ inline BOOL DoesWindows10StartMenuExist()
             HMODULE hStartTileData = LoadLibraryExW(L"StartTileData.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if (hStartTileData)
             {
-                typedef HRESULT (WINAPI *DllGetClassObject_t)(REFCLSID rclsid, REFIID riid, LPVOID* ppv);
-                DllGetClassObject_t pfnDllGetClassObject = (DllGetClassObject_t)GetProcAddress(hStartTileData, "DllGetClassObject");
-
-                if (pfnDllGetClassObject)
-                {
 #ifdef __cplusplus
-                    IClassFactory* pFactory;
-                    HRESULT hr = pfnDllGetClassObject(CLSID_StartLayoutFactory, IID_PPV_ARGS(&pFactory));
-                    if (SUCCEEDED(hr))
-                    {
-                        bRet = TRUE;
-                        pFactory->Release();
-                    }
+                bRet = TestClsidExists(hStartTileData, CLSID_StartLayoutFactory);
 #else
-                    IClassFactory* pFactory;
-                    HRESULT hr = pfnDllGetClassObject(&CLSID_StartLayoutFactory, &IID_IClassFactory, (void**)&pFactory);
-                    if (SUCCEEDED(hr))
-                    {
-                        bRet = TRUE;
-                        pFactory->lpVtbl->Release(pFactory);
-                    }
+                bRet = TestClsidExists(hStartTileData, &CLSID_StartLayoutFactory);
 #endif
+                if (!bRet)
+                {
+                    SHGetFolderPathW(NULL, SPECIAL_FOLDER, NULL, SHGFP_TYPE_CURRENT, szPath);
+                    wcscat_s(szPath, MAX_PATH, _T(APP_RELATIVE_PATH) L"\\ep_starttiledata.dll");
+
+                    HMODULE hMyStartTileData = LoadLibraryW(szPath);
+                    if (hMyStartTileData)
+                    {
+#ifdef __cplusplus
+                        bRet = TestClsidExists(hMyStartTileData, CLSID_StartLayoutFactory);
+#else
+                        bRet = TestClsidExists(hMyStartTileData, &CLSID_StartLayoutFactory);
+#endif
+                        FreeLibrary(hMyStartTileData);
+                    }
                 }
 
                 FreeLibrary(hStartTileData);

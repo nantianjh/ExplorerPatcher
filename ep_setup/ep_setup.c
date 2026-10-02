@@ -13,7 +13,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #ifdef WITH_ENCRYPTION
 #include "rijndael-alg-fst.c" // Include the C file for __forceinline to work
 #endif
-#pragma comment(lib, "zs.lib")
+#pragma comment(lib, "libzs.lib")
 
 static UINT g_uFailureLine;
 
@@ -1402,6 +1402,8 @@ int WINAPI wWinMain(
                 RegDeleteKeyW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellServiceObjects\\{C2796011-81BA-4148-8FCA-C6643245113F}");
             }
         }
+
+        if (CHECK_OK(bOk)) bOk = InstallResource(bInstall && IsWindows11(), hInstance, zipFile, "ep_starttiledata.dll", wszPath, L"ep_starttiledata.dll");
 
         // --------------------------------------------------------------------------------
 

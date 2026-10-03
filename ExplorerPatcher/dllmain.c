@@ -956,6 +956,15 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_COLUMNS_DEFAULT 3
 #define EP_LAUNCHER_GROUP_COLUMNS_MIN 1
 #define EP_LAUNCHER_GROUP_COLUMNS_MAX 64
+#define EP_LAUNCHER_GROUP_FONTSCALE_VALUE L"LauncherGroupsFontScale"
+#define EP_LAUNCHER_GROUP_FONTSCALE_DEFAULT 100
+#define EP_LAUNCHER_GROUP_FONTSCALE_MIN 50
+#define EP_LAUNCHER_GROUP_FONTSCALE_MAX 300
+#define EP_LAUNCHER_GROUP_FONTSCALE_STEP 25
+#define EP_LAUNCHER_GROUP_MENU_FONTSCALE_UP 2160
+#define EP_LAUNCHER_GROUP_MENU_FONTSCALE_DOWN 2161
+#define EP_LAUNCHER_GROUP_MENU_FONTSCALE_RESET 2162
+#define EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM 2163
 
 typedef enum _LauncherGroupsViewMode
 {
@@ -986,6 +995,7 @@ typedef struct _LauncherGroup
     HIMAGELIST hImageListSmall;
     HIMAGELIST hImageListMedium;
     HIMAGELIST hImageListLarge;
+    HFONT hFont;
     HICON hIconSmall;
     HICON hIconLarge;
     BOOL bMenuActive;
@@ -1025,6 +1035,7 @@ DWORD g_launcherGroupsLastHoverTick = 0;
 DWORD g_launcherGroupsLastMouseCheckTick = 0;
 DWORD g_launcherGroupsViewMode = LAUNCHER_GROUP_VIEW_LIST;
 DWORD g_launcherGroupsColumnsPerRow = EP_LAUNCHER_GROUP_COLUMNS_DEFAULT;
+DWORD g_launcherGroupsFontScale = 100;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -2117,6 +2128,98 @@ void LauncherGroups_SetAndSaveColumnsPerRow(DWORD columns)
     );
 }
 
+DWORD LauncherGroups_ClampFontScale(DWORD scale)
+{
+    if (scale < EP_LAUNCHER_GROUP_FONTSCALE_MIN)
+    {
+        return EP_LAUNCHER_GROUP_FONTSCALE_DEFAULT;
+    }
+    if (scale > EP_LAUNCHER_GROUP_FONTSCALE_MAX)
+    {
+        return EP_LAUNCHER_GROUP_FONTSCALE_MAX;
+    }
+    return scale;
+}
+
+void LauncherGroups_ReadFontScaleFromRegistry()
+{
+    HKEY hKey = NULL;
+    DWORD scale = EP_LAUNCHER_GROUP_FONTSCALE_DEFAULT;
+    DWORD cb = sizeof(scale);
+    DWORD type = REG_DWORD;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        RegQueryValueExW(hKey, EP_LAUNCHER_GROUP_FONTSCALE_VALUE, NULL, &type, (BYTE*)&scale, &cb);
+        RegCloseKey(hKey);
+    }
+    g_launcherGroupsFontScale = LauncherGroups_ClampFontScale(scale);
+}
+
+BOOL LauncherGroups_WriteFontScaleToRegistry(DWORD scale)
+{
+    HKEY hKey = NULL;
+    BOOL ok = FALSE;
+
+    scale = LauncherGroups_ClampFontScale(scale);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        ok = RegSetValueExW(hKey, EP_LAUNCHER_GROUP_FONTSCALE_VALUE, 0, REG_DWORD, (const BYTE*)&scale, sizeof(scale)) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+    }
+    return ok;
+}
+
+void LauncherGroups_SetFontScale(DWORD scale)
+{
+    scale = LauncherGroups_ClampFontScale(scale);
+    if (g_launcherGroupsFontScale == scale)
+    {
+        return;
+    }
+
+    g_launcherGroupsFontScale = scale;
+    LauncherGroups_PostColumnsChanged();
+    EPDebugLogWrite(
+        L"launcher-groups set font scale=%lu saved=%d",
+        scale,
+        LauncherGroups_WriteFontScaleToRegistry(scale)
+    );
+}
+
+int LauncherGroups_PromptForFontScale(LauncherGroup* group)
+{
+    WCHAR answer[16];
+    WCHAR defaultValue[16];
+    WCHAR prompt[128];
+    BOOL cancelled = FALSE;
+
+    if (!group)
+    {
+        return 0;
+    }
+
+    swprintf_s(defaultValue, ARRAYSIZE(defaultValue), L"%lu", g_launcherGroupsFontScale);
+    swprintf_s(prompt, ARRAYSIZE(prompt), L"\u8BF7\u8F93\u5165\u6587\u5B57\u7F29\u653E\u767E\u5206\u6BD4\uFF08%d - %d\uFF09",
+        EP_LAUNCHER_GROUP_FONTSCALE_MIN, EP_LAUNCHER_GROUP_FONTSCALE_MAX);
+
+    group->bKeepVisibleForModal = TRUE;
+    HRESULT hrInput = InputBox(FALSE, group->hWnd, prompt, L"\u6587\u5B57\u7F29\u653E\u6BD4\u4F8B", defaultValue, answer, ARRAYSIZE(answer), &cancelled);
+    group->bKeepVisibleForModal = FALSE;
+    if (FAILED(hrInput) || cancelled || !answer[0])
+    {
+        return 0;
+    }
+
+    WCHAR* end = NULL;
+    long value = wcstol(answer, &end, 10);
+    if (end == answer || value < EP_LAUNCHER_GROUP_FONTSCALE_MIN || value > EP_LAUNCHER_GROUP_FONTSCALE_MAX)
+    {
+        return 0;
+    }
+    return (int)value;
+}
+
 int LauncherGroups_PromptForColumnsPerRow(LauncherGroup* group)
 {
     WCHAR answer[16];
@@ -2329,6 +2432,75 @@ void LauncherGroups_CreateAppsImageLists(LauncherGroup* group)
     }
 }
 
+HFONT LauncherGroups_CreateAppsFont(HWND hWnd)
+{
+    NONCLIENTMETRICSW ncm;
+    LOGFONTW lf;
+    HFONT hFont;
+    UINT dpi = 96;
+
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+    {
+        lf = ncm.lfCaptionFont;
+    }
+    else
+    {
+        ZeroMemory(&lf, sizeof(lf));
+        lf.lfHeight = -12;
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfOutPrecision = OUT_TT_PRECIS;
+        lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+        wcscpy_s(lf.lfFaceName, ARRAYSIZE(lf.lfFaceName), L"Segoe UI");
+    }
+
+    if (hWnd && IsWindow(hWnd))
+    {
+        UINT windowDpi = GetDpiForWindow(hWnd);
+        if (windowDpi)
+        {
+            dpi = windowDpi;
+        }
+    }
+
+    if (dpi != 96)
+    {
+        lf.lfHeight = MulDiv(lf.lfHeight, (int)dpi, 96);
+    }
+
+    if (g_launcherGroupsFontScale != 100)
+    {
+        lf.lfHeight = MulDiv(lf.lfHeight, (int)g_launcherGroupsFontScale, 100);
+        if (lf.lfHeight == 0)
+        {
+            lf.lfHeight = -1;
+        }
+    }
+
+    hFont = CreateFontIndirectW(&lf);
+    return hFont;
+}
+
+void LauncherGroups_ApplyAppsFont(LauncherGroup* group)
+{
+    if (!group || !group->hListView || !IsWindow(group->hListView))
+    {
+        return;
+    }
+
+    if (group->hFont)
+    {
+        DeleteObject(group->hFont);
+        group->hFont = NULL;
+    }
+
+    group->hFont = LauncherGroups_CreateAppsFont(group->hWnd);
+    if (group->hFont)
+    {
+        SendMessageW(group->hListView, WM_SETFONT, (WPARAM)group->hFont, TRUE);
+    }
+}
+
 BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
 {
     if (!group || !hWnd)
@@ -2339,7 +2511,6 @@ BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
     {
         return TRUE;
     }
-
     group->hListView = CreateWindowExW(
         WS_EX_CLIENTEDGE | WS_EX_ACCEPTFILES,
         WC_LISTVIEWW,
@@ -2360,7 +2531,7 @@ BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
     }
 
     SetWindowTheme(group->hListView, L"Explorer", NULL);
-    SendMessageW(group->hListView, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    LauncherGroups_ApplyAppsFont(group);
     ListView_SetExtendedListViewStyle(group->hListView, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP);
     DragAcceptFiles(group->hListView, TRUE);
     LauncherGroups_RegisterDropTargets(group);
@@ -2381,6 +2552,7 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
     int paddingCy;
     int maxCx;
     int maxCy;
+    int availCx;
 
     size.cx = 300;
     size.cy = 160;
@@ -2411,6 +2583,34 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
             if (maxCy > 160)
             {
                 size.cy = min(size.cy, maxCy);
+            }
+
+            //图标视图下ListView 按客户区宽度自动换行，若窗口被工作区宽度截断，
+            //实际每行数会少于设定值。这里按可用的客户区宽度回推能放下的列数，
+            //并据此重算宽度，避免出现"设了4 个却只显示 3 个、右侧留白"的错位。
+            if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy)
+                && cellCx > 0)
+            {
+                int frameCx = 0;
+                RECT rc;
+                GetClientRect(group->hWnd, &rc);
+                frameCx = max(0, rc.right - (int)size.cx);
+
+                availCx = maxCx - frameCx - 8/* ListView 左侧内边距 */ - 8/* 右侧内边距 */;
+                if (availCx > cellCx)
+                {
+                    int fitColumns = max(1, availCx / cellCx);
+                    if (fitColumns < columns)
+                    {
+                        columns = fitColumns;
+                        rows = (int)((count + columns - 1) / columns);
+                        size.cx = columns * cellCx + paddingCx;
+                        if (size.cx > maxCx)
+                        {
+                            size.cx = maxCx;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2453,11 +2653,13 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
     }
 
     LauncherGroups_CreateAppsImageLists(group);
+    LauncherGroups_ApplyAppsFont(group);
     style = (DWORD)GetWindowLongPtrW(group->hListView, GWL_STYLE);
     style &= ~(LVS_TYPEMASK | LVS_NOCOLUMNHEADER | LVS_NOSORTHEADER | LVS_NOSCROLL);
     viewStyle = LauncherGroups_GetAppsListViewStyle();
     SetWindowLongPtrW(group->hListView, GWL_STYLE, style | viewStyle | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | LVS_NOSCROLL);
     SetWindowPos(group->hListView, NULL, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+    LauncherGroups_ApplyAppsFont(group);
 
     ListView_DeleteAllItems(group->hListView);
     while (ListView_DeleteColumn(group->hListView, 0))
@@ -2899,6 +3101,11 @@ void LauncherGroups_FreeGroup(LauncherGroup* group)
         }
     }
     LauncherGroups_FreeItems(group);
+    if (group->hFont)
+    {
+        DeleteObject(group->hFont);
+        group->hFont = NULL;
+    }
     free(group);
 }
 
@@ -3485,6 +3692,7 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
     HMENU hMenu;
     HMENU hViewMenu;
     HMENU hArrangeMenu;
+    HMENU hFontMenu;
     POINT pt;
     int cmd;
     HWND hSourceWnd;
@@ -3543,6 +3751,22 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
             );
         }
         AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hArrangeMenu, L"\u6392\u5217\u6A21\u5F0F");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+
+    hFontMenu = CreatePopupMenu();
+    if (hFontMenu)
+    {
+        WCHAR fontText[64];
+        swprintf_s(fontText, ARRAYSIZE(fontText), L"\u6587\u5B57\u5927\u5C0F\uFF08\u5F53\u524D %lu%%\uFF09", g_launcherGroupsFontScale);
+        AppendMenuW(hFontMenu, MF_STRING | MF_GRAYED, 0, fontText);
+        AppendMenuW(hFontMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hFontMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_FONTSCALE_UP, L"\u589E\u5927\uFF08+25%\uFF09");
+        AppendMenuW(hFontMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_FONTSCALE_DOWN, L"\u7F29\u5C0F\uFF08-25%\uFF09");
+        AppendMenuW(hFontMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_FONTSCALE_RESET, L"\u6062\u590D\u9ED8\u8BA4\uFF08100%\uFF09");
+        AppendMenuW(hFontMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hFontMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM, L"\u81EA\u5B9A\u4E49\u6BD4\u4F8B...");
+        AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hFontMenu, L"\u6587\u5B57\u5927\u5C0F");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
 
@@ -3630,6 +3854,45 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
         if (columns)
         {
             LauncherGroups_SetAndSaveColumnsPerRow(columns);
+            LauncherGroups_UpdateAppsWindow(group);
+            if (group->bAppsVisible)
+            {
+                LauncherGroups_PositionAppsWindow(group);
+            }
+        }
+    }
+    else if (cmd >= EP_LAUNCHER_GROUP_MENU_FONTSCALE_UP && cmd <= EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM)
+    {
+        BOOL bChanged = FALSE;
+
+        if (cmd == EP_LAUNCHER_GROUP_MENU_FONTSCALE_UP)
+        {
+            LauncherGroups_SetFontScale(LauncherGroups_ClampFontScale(g_launcherGroupsFontScale + EP_LAUNCHER_GROUP_FONTSCALE_STEP));
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_FONTSCALE_DOWN)
+        {
+            LauncherGroups_SetFontScale(LauncherGroups_ClampFontScale(g_launcherGroupsFontScale - EP_LAUNCHER_GROUP_FONTSCALE_STEP));
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_FONTSCALE_RESET)
+        {
+            LauncherGroups_SetFontScale(EP_LAUNCHER_GROUP_FONTSCALE_DEFAULT);
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM)
+        {
+            int custom = LauncherGroups_PromptForFontScale(group);
+            if (custom > 0)
+            {
+                LauncherGroups_SetFontScale((DWORD)custom);
+                bChanged = TRUE;
+            }
+        }
+
+        if (bChanged)
+        {
+            LauncherGroups_ApplyAppsFont(group);
             LauncherGroups_UpdateAppsWindow(group);
             if (group->bAppsVisible)
             {
@@ -3729,6 +3992,27 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             LauncherGroups_RegisterDropTargets(group);
         }
         EPDebugLogWrite(L"launcher-group create hwnd=%p group=\"%s\"", hWnd, group ? group->szName : L"");
+        return 0;
+    case WM_DPICHANGED:
+        if (group)
+        {
+            RECT* prc = (RECT*)lParam;
+            LauncherGroups_ApplyAppsFont(group);
+            if (prc)
+            {
+                SetWindowPos(
+                    hWnd,
+                    NULL,
+                    prc->left,
+                    prc->top,
+                    prc->right - prc->left,
+                    prc->bottom - prc->top,
+                    SWP_NOZORDER | SWP_NOACTIVATE
+                );
+            }
+            LauncherGroups_UpdateWindowSize(group);
+            LauncherGroups_UpdateAppsWindow(group);
+        }
         return 0;
     case WM_DWMSENDICONICTHUMBNAIL:
     {
@@ -4006,6 +4290,7 @@ DWORD LauncherGroupsThread(DWORD unused)
     g_launcherGroupsThreadId = GetCurrentThreadId();
     g_launcherGroupsViewMode = LauncherGroups_ReadViewModeFromRegistry();
     LauncherGroups_ReadColumnsFromRegistry();
+    LauncherGroups_ReadFontScaleFromRegistry();
 
     ZeroMemory(&icc, sizeof(icc));
     icc.dwSize = sizeof(icc);

@@ -1748,7 +1748,7 @@ BOOL LauncherGroups_IsPointOnAppsWindow(LauncherGroup* group, POINT pt)
     return FALSE;
 }
 
-LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
+LauncherGroup* LauncherGroups_FindGroupAtPointEx(POINT pt, BOOL bAllowPopupCover)
 {
     HRESULT hr;
     HRESULT hrCo;
@@ -1760,7 +1760,17 @@ LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
     BSTR elemName = NULL;
     LauncherGroup* group = NULL;
 
-    if (!g_launcherGroups || !LauncherGroups_IsTaskbarPoint(pt))
+    if (!g_launcherGroups)
+    {
+        return NULL;
+    }
+
+    // 拖动换位时必须允许落点被弹出窗口覆盖（bAllowPopupCover=TRUE）：
+    // 分组窗口在悬停时自动弹出，向左拖动时落点常常落在自己或邻居的弹出窗口上，
+    // 此时 IsTaskbarPoint 会因 WindowFromPoint 命中弹出窗口而返回 FALSE，
+    // 导致 target恒为 NULL（日志实测10 次向左拖 8 次 none）。
+    // 拖动中不能因为"落点不在任务栏上"就放弃找目标，应交给 UIA 名字匹配去判定。
+    if (!bAllowPopupCover && !LauncherGroups_IsTaskbarPoint(pt))
     {
         return NULL;
     }
@@ -1826,6 +1836,12 @@ LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
     return group;
 }
 
+// 常规查找：要求落点确实在任务栏上（悬停、菜单等交互用）。
+LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
+{
+    return LauncherGroups_FindGroupAtPointEx(pt, FALSE);
+}
+
 BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
 {
     POINT pt;
@@ -1881,10 +1897,17 @@ BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
             {
                 LauncherGroup* target;
                 g_launcherGroupsLastDragCheckTick = tick;
-                target = LauncherGroups_FindGroupAtPoint(pt);
+                // 拖动中必须用 FindGroupAtPointEx(TRUE)：向左拖时落点通常被
+                // 自己或邻居的弹出窗口盖住，若仍要求"落点在任务栏上"，
+                // 目标恒为 NULL，表现为向左拖永远换不了位。
+                target = LauncherGroups_FindGroupAtPointEx(pt, TRUE);
                 g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
             }
         }
+        // 拖动期间必须屏蔽下面的悬停弹窗逻辑：它会在鼠标经过每个分组时
+        // 弹出该分组的项目窗口，既遮挡后续落点（导致目标查找失败），
+        // 又造成窗口反复开合的视觉干扰。日志实测 15:21-15:22 拖动期间
+        // apps window show 触发了 20+ 次。
         return TRUE;
     }
 
@@ -4842,6 +4865,84 @@ int LauncherGroups_HitTestListViewItemAtPoint(LauncherGroup* group, POINT ptScre
     return -1;
 }
 
+// 把屏幕坐标解析成"应该落到哪一项"。
+// 直接用 ListView_HitTest 在两种情况下会返回 -1，用户就完全看不到落点提示：
+//   1) 落在两项之间的间隙（图标模式格子大，间隙很大，实测 target=-1 出现 5 次）；
+//   2) 落在列表边缘。
+// 这里在 HitTest 失败时按坐标回退到"最接近的项"，保证任何位置都有明确落点。
+int LauncherGroups_ResolveDropTarget(LauncherGroup* group, POINT ptScreen)
+{
+    POINT ptClient;
+    int i;
+    int best = -1;
+    long long bestDist = -1;
+
+    if (!group || !group->hListView || !IsWindow(group->hListView))
+    {
+        return -1;
+    }
+
+    ptClient = ptScreen;
+    ScreenToClient(group->hListView, &ptClient);
+
+    // 命中测试对"落在项上"最可靠，优先采用。
+    {
+        LVHITTESTINFO hitTest;
+        ZeroMemory(&hitTest, sizeof(hitTest));
+        hitTest.pt = ptClient;
+        if (ListView_HitTest(group->hListView, &hitTest) >= 0 && (hitTest.flags & LVHT_ONITEM))
+        {
+            return hitTest.iItem;
+        }
+    }
+
+    // 回退：取各项矩形中距离落点最近的一项。
+    for (i = 0; i < (int)group->cItems; i++)
+    {
+        RECT rcItem;
+        RECT rcHit;
+        long long dx;
+        long long dy;
+        long long dist;
+
+        if (!ListView_GetItemRect(group->hListView, i, &rcItem, LVIR_BOUNDS))
+        {
+            continue;
+        }
+        rcHit = rcItem;
+        if (ptClient.x < rcHit.left)
+        {
+            rcHit.left = ptClient.x;
+        }
+        if (ptClient.x > rcHit.right)
+        {
+            rcHit.right = ptClient.x;
+        }
+        if (ptClient.y < rcHit.top)
+        {
+            rcHit.top = ptClient.y;
+        }
+        if (ptClient.y > rcHit.bottom)
+        {
+            rcHit.bottom = ptClient.y;
+        }
+        dx = rcHit.right - rcHit.left;
+        dy = rcHit.bottom - rcHit.top;
+        dist = dx * dx + dy * dy;
+        if (bestDist < 0 || dist < bestDist)
+        {
+            bestDist = dist;
+            best = i;
+            // 落点就在某项矩形内（距离为 0），无需再找更近的。
+            if (dist == 0)
+            {
+                break;
+            }
+        }
+    }
+    return best;
+}
+
 // ListView 子类：拖动期间鼠标捕获在 ListView 上（见 LVN_BEGINDRAG），
 // 因此 WM_MOUSEMOVE / WM_LBUTTONUP 必须在这里处理，父窗口收不到。
 // 同时负责绘制"插入位置"高亮，松手时调用 LauncherGroups_MoveItem。
@@ -4864,7 +4965,7 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             pt.x = GET_X_LPARAM(lParam);
             pt.y = GET_Y_LPARAM(lParam);
             ClientToScreen(hWnd, &pt);
-            target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            target = LauncherGroups_ResolveDropTarget(group, pt);
             if (!g_launcherGroupsItemDragMoveLogged)
             {
                 // 首条移动即打点：证明捕获确实回到了 ListView 子类。
@@ -4878,10 +4979,15 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             if (target >= 0 && target != group->iLastDropTarget)
             {
                 group->iLastDropTarget = target;
-                // 高亮目标项，让用户看到会落到哪
-                ListView_SetItemState(hWnd, -1, LVIS_SELECTED | LVIS_FOCUSED, 0);
-                ListView_SetItemState(hWnd, target, LVIS_SELECTED | LVIS_FOCUSED,
-                    LVIS_SELECTED | LVIS_FOCUSED);
+                // 高亮目标项，让用户看到会落到哪。
+                // 用 LVIS_DROPHILITED（拖放高亮）叠加 LVIS_SELECTED：
+                // 图标模式下纯 LVIS_SELECTED 的底色很淡，用户反馈"选中/拖动效果不明显"，
+                // DROPHILITED 会给出明确的插入点框线。
+                ListView_SetItemState(hWnd, -1, LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED, 0);
+                ListView_SetItemState(hWnd, target, LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED,
+                    LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED);
+                // 拖动中让 ListView 重绘，否则高亮在部分主题下不可见。
+                InvalidateRect(hWnd, NULL, FALSE);
             }
             return 0;
         }
@@ -4893,7 +4999,7 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             pt.x = GET_X_LPARAM(lParam);
             pt.y = GET_Y_LPARAM(lParam);
             ClientToScreen(hWnd, &pt);
-            target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            target = LauncherGroups_ResolveDropTarget(group, pt);
             fromIndex = group->iDragItem;
             EPDebugLogWrite(
                 L"launcher-group item drag up hwnd=%p from=%d target=%d capture=%p",
@@ -4909,6 +5015,12 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             group->bDragActive = FALSE;
             group->iDragItem = -1;
             group->iLastDropTarget = -1;
+            // 清除拖放高亮，避免松手后框线残留（MoveItem 会重建列表并自带选中态）。
+            if (group->hListView && IsWindow(group->hListView))
+            {
+                ListView_SetItemState(hWnd, -1, LVIS_DROPHILITED, 0);
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
             if (target >= 0 && target < (int)group->cItems && target != fromIndex)
             {
                 LauncherGroups_MoveItem(group, fromIndex, target);
@@ -5070,6 +5182,16 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                     }
                 }
                 itemIndex = LauncherGroups_HitTestListViewItem(group);
+                // 显式设置选中态：图标视图下 ListView 默认的选中底色很淡，
+                // 用户反馈"选中效果不明显"。这里叠加 DROPHILITED 的框线并强制重绘。
+                if (itemIndex >= 0 && itemIndex < (int)group->cItems && group->hListView)
+                {
+                    ListView_SetItemState(group->hListView, -1, LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED, 0);
+                    ListView_SetItemState(group->hListView, itemIndex,
+                        LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED,
+                        LVIS_SELECTED | LVIS_FOCUSED | LVIS_DROPHILITED);
+                    InvalidateRect(group->hListView, NULL, FALSE);
+                }
                 LauncherGroups_LaunchListViewItem(group, itemIndex, FALSE);
                 return 0;
             }

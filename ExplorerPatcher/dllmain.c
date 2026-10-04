@@ -1059,6 +1059,25 @@ BOOL g_launcherGroupsDragMoved = FALSE;
 BOOL g_launcherGroupsItemDragMoveLogged = FALSE;
 int g_launcherGroupsTaskbarDragSeq = 0;
 
+// 拖动换位的目标查找改用**几何矩形法**：
+// 按下时用 UIA 一次性收集所有分组按钮的屏幕矩形，拖动中做矩形命中。
+// 原因：UIA ElementFromPoint 对**按钮边缘与间隙**极敏感——落点差几个像素
+// 就会返回任务栏容器而非按钮，名字匹配失败（日志实测：成功落点 y=1297，
+// 失败落点 y=1316/1335，只是偏下 20px 就全部 (none)）。这与窗口内
+// ListView 在两项间隙返回 -1 是同一类病，点命中法对"空白/边缘"天然不可靠；
+// 矩形法+最近中心回退彻底消除该问题，且免去拖动中每 40ms 一次的 UIA 开销。
+typedef struct _LauncherGroupsTaskbarButtonRect
+{
+    WCHAR szName[128];
+    RECT rc;
+} LauncherGroupsTaskbarButtonRect;
+static LauncherGroupsTaskbarButtonRect g_launcherGroupsTaskbarButtonRects[16];
+static int g_launcherGroupsTaskbarButtonRectCount = 0;
+// 拖动高亮指示窗口：SetCapture 到 Shell_TrayWnd 后 XAML 按钮完全感知不到拖动，
+// 任务栏不会显示任何拖动视觉——这是用户反复反馈"无响应"的观感来源之一。
+// 用一个分层窗口叠在目标按钮上做高亮，up 时隐藏。
+static HWND g_launcherGroupsDragIndicatorWnd = NULL;
+
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
 SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group);
@@ -1842,6 +1861,243 @@ LauncherGroup* LauncherGroups_FindGroupAtPoint(POINT pt)
     return LauncherGroups_FindGroupAtPointEx(pt, FALSE);
 }
 
+// ───────────────────────── 几何矩形法 ─────────────────────────
+
+// 递归遍历任务栏 UIA 控制树，收集所有"名字=分组名"的元素的屏幕矩形。
+static void LauncherGroups_CollectRectsFromElement(
+    IUIAutomationTreeWalker* pWalker,
+    IUIAutomationElement* pElement,
+    int depth)
+{
+    BSTR name = NULL;
+    IUIAutomationElement* pChild = NULL;
+
+    if (!pWalker || !pElement || depth > 8
+        || g_launcherGroupsTaskbarButtonRectCount >= (int)ARRAYSIZE(g_launcherGroupsTaskbarButtonRects))
+    {
+        return;
+    }
+
+    if (SUCCEEDED(pElement->lpVtbl->get_CurrentName(pElement, &name)) && name)
+    {
+        LauncherGroup* group = LauncherGroups_FindByName(name);
+        if (group)
+        {
+            RECT rc;
+            if (SUCCEEDED(pElement->lpVtbl->get_CurrentBoundingRectangle(pElement, &rc))
+                && rc.right > rc.left && rc.bottom > rc.top)
+            {
+                LauncherGroupsTaskbarButtonRect* slot
+                    = &g_launcherGroupsTaskbarButtonRects[g_launcherGroupsTaskbarButtonRectCount];
+                wcsncpy_s(slot->szName, ARRAYSIZE(slot->szName), name, _TRUNCATE);
+                slot->rc = rc;
+                g_launcherGroupsTaskbarButtonRectCount++;
+            }
+        }
+        SysFreeString(name);
+    }
+
+    if (FAILED(pWalker->lpVtbl->GetFirstChildElement(pWalker, pElement, &pChild)) || !pChild)
+    {
+        return;
+    }
+    while (pChild)
+    {
+        IUIAutomationElement* pNext = NULL;
+        LauncherGroups_CollectRectsFromElement(pWalker, pChild, depth + 1);
+        if (FAILED(pWalker->lpVtbl->GetNextSiblingElement(pWalker, pChild, &pNext)) || !pNext)
+        {
+            pChild->lpVtbl->Release(pChild);
+            pChild = NULL;
+            break;
+        }
+        pChild->lpVtbl->Release(pChild);
+        pChild = pNext;
+    }
+}
+
+// 按下时调用一次：从任务栏根窗口收集全部分组按钮矩形。
+// 拖动期间分组顺序不变（交换发生在释放时），缓存全程有效。
+void LauncherGroups_CollectTaskbarButtonRects(HWND hTrayWnd)
+{
+    HRESULT hrCo;
+    BOOL bCoUninitialize = FALSE;
+    IUIAutomation2* pUIA = NULL;
+    IUIAutomationTreeWalker* pWalker = NULL;
+    IUIAutomationElement* pRoot = NULL;
+
+    g_launcherGroupsTaskbarButtonRectCount = 0;
+    if (!hTrayWnd || !IsWindow(hTrayWnd) || !g_launcherGroups)
+    {
+        return;
+    }
+
+    hrCo = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bCoUninitialize = SUCCEEDED(hrCo);
+    if (SUCCEEDED(CoCreateInstance(&CLSID_CUIAutomation8, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation2, &pUIA))
+        && pUIA)
+    {
+        if (SUCCEEDED(pUIA->lpVtbl->ElementFromHandle(pUIA, hTrayWnd, &pRoot)) && pRoot)
+        {
+            pUIA->lpVtbl->get_ControlViewWalker(pUIA, &pWalker);
+            if (pWalker)
+            {
+                LauncherGroups_CollectRectsFromElement(pWalker, pRoot, 0);
+            }
+            pRoot->lpVtbl->Release(pRoot);
+        }
+        pUIA->lpVtbl->Release(pUIA);
+    }
+    if (bCoUninitialize)
+    {
+        CoUninitialize();
+    }
+    EPDebugLogWrite(L"launcher-group taskbar rects collected count=%d", g_launcherGroupsTaskbarButtonRectCount);
+}
+
+// 拖动中按矩形找目标：精确命中优先，未命中取中心最近的按钮
+// （覆盖按钮间隙、边缘、被弹出窗口遮挡三类落点）。
+LauncherGroup* LauncherGroups_FindGroupByRects(POINT pt)
+{
+    int i;
+    LauncherGroup* best = NULL;
+    long long bestDist = -1;
+
+    for (i = 0; i < g_launcherGroupsTaskbarButtonRectCount; i++)
+    {
+        if (PtInRect(&g_launcherGroupsTaskbarButtonRects[i].rc, pt))
+        {
+            return LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName);
+        }
+    }
+    for (i = 0; i < g_launcherGroupsTaskbarButtonRectCount; i++)
+    {
+        LauncherGroup* group;
+        long long cx = (g_launcherGroupsTaskbarButtonRects[i].rc.left
+            + g_launcherGroupsTaskbarButtonRects[i].rc.right) / 2;
+        long long cy = (g_launcherGroupsTaskbarButtonRects[i].rc.top
+            + g_launcherGroupsTaskbarButtonRects[i].rc.bottom) / 2;
+        long long dx = pt.x - cx;
+        long long dy = pt.y - cy;
+        long long dist = dx * dx + dy * dy;
+        group = LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName);
+        if (group && (bestDist < 0 || dist < bestDist))
+        {
+            bestDist = dist;
+            best = group;
+        }
+    }
+    return best;
+}
+
+// 拖动高亮指示器：分层窗口叠在目标按钮矩形上，半透明高亮。
+// 不用 STATIC 类：分层窗口下 STATIC 无内容可绘会整片透明，
+// 必须自绘背景色才能保证可见。
+static LRESULT CALLBACK LauncherGroups_DragIndicatorWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    if (uMsg == WM_ERASEBKGND)
+    {
+        HBRUSH hBrush = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        FillRect((HDC)wParam, &rc, hBrush);
+        DeleteObject(hBrush);
+        return 1;
+    }
+    if (uMsg == WM_PAINT)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        HBRUSH hBrush = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+        FillRect(hdc, &ps.rcPaint, hBrush);
+        DeleteObject(hBrush);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+static BOOL LauncherGroups_EnsureDragIndicatorClass()
+{
+    WNDCLASSEXW wc;
+    static BOOL bRegistered = FALSE;
+    if (bRegistered)
+    {
+        return TRUE;
+    }
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = LauncherGroups_DragIndicatorWndProc;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = L"EP_LauncherGroupDragIndicator";
+    bRegistered = RegisterClassExW(&wc) != 0;
+    return bRegistered;
+}
+
+void LauncherGroups_UpdateDragIndicator(POINT pt)
+{
+    int i;
+    BOOL bFound = FALSE;
+
+    if (!g_launcherGroupsDragActive || !g_launcherGroupsDragGroup)
+    {
+        return;
+    }
+    for (i = 0; i < g_launcherGroupsTaskbarButtonRectCount; i++)
+    {
+        LauncherGroup* group = LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName);
+        if (group && group != g_launcherGroupsDragGroup
+            && PtInRect(&g_launcherGroupsTaskbarButtonRects[i].rc, pt))
+        {
+            bFound = TRUE;
+            if (!g_launcherGroupsDragIndicatorWnd && LauncherGroups_EnsureDragIndicatorClass())
+            {
+                g_launcherGroupsDragIndicatorWnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    L"EP_LauncherGroupDragIndicator",
+                    NULL,
+                    WS_POPUP,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.left,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.top,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.right - g_launcherGroupsTaskbarButtonRects[i].rc.left,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.bottom - g_launcherGroupsTaskbarButtonRects[i].rc.top,
+                    NULL,
+                    NULL,
+                    GetModuleHandleW(NULL),
+                    NULL);
+                if (g_launcherGroupsDragIndicatorWnd)
+                {
+                    SetLayeredWindowAttributes(g_launcherGroupsDragIndicatorWnd,
+                        0, 90, LWA_ALPHA);
+                }
+            }
+            if (g_launcherGroupsDragIndicatorWnd)
+            {
+                SetWindowPos(g_launcherGroupsDragIndicatorWnd, HWND_TOPMOST,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.left,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.top,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.right - g_launcherGroupsTaskbarButtonRects[i].rc.left,
+                    g_launcherGroupsTaskbarButtonRects[i].rc.bottom - g_launcherGroupsTaskbarButtonRects[i].rc.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            break;
+        }
+    }
+    if (!bFound && g_launcherGroupsDragIndicatorWnd)
+    {
+        ShowWindow(g_launcherGroupsDragIndicatorWnd, SW_HIDE);
+    }
+}
+
+void LauncherGroups_HideDragIndicator()
+{
+    if (g_launcherGroupsDragIndicatorWnd)
+    {
+        ShowWindow(g_launcherGroupsDragIndicatorWnd, SW_HIDE);
+    }
+}
+
 BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
 {
     POINT pt;
@@ -1897,11 +2153,15 @@ BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
             {
                 LauncherGroup* target;
                 g_launcherGroupsLastDragCheckTick = tick;
-                // 拖动中必须用 FindGroupAtPointEx(TRUE)：向左拖时落点通常被
-                // 自己或邻居的弹出窗口盖住，若仍要求"落点在任务栏上"，
-                // 目标恒为 NULL，表现为向左拖永远换不了位。
-                target = LauncherGroups_FindGroupAtPointEx(pt, TRUE);
+                // 几何矩形法：按下时已收集全部分组按钮矩形，这里只做矩形命中。
+                // UIA ElementFromPoint 对按钮边缘/间隙极敏感（实测落点只是偏下
+                // 20px，y=1297 成功、y=1316/1335 就全部 (none)），点命中法不可靠；
+                // 矩形法+最近中心回退彻底消除该问题，也不再需要逐点 UIA 查询。
+                target = LauncherGroups_FindGroupByRects(pt);
                 g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
+                // 高亮目标按钮：SetCapture 后 XAML 按钮感知不到拖动，
+                // 必须自己给视觉反馈，否则用户看不到任何变化。
+                LauncherGroups_UpdateDragIndicator(pt);
             }
         }
         // 拖动期间必须屏蔽下面的悬停弹窗逻辑：它会在鼠标经过每个分组时
@@ -1982,6 +2242,13 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
             g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
         }
         SetCapture(g_launcherGroupsTaskbarWnd);
+        // 收集全部分组按钮矩形（一次 UIA 遍历），供拖动中几何命中。
+        // 必须在 down 时做：拖动期间分组顺序不变，缓存全程有效。
+        LauncherGroups_CollectTaskbarButtonRects(g_launcherGroupsTaskbarWnd);
+        if (g_launcherGroupsDragIndicatorWnd)
+        {
+            ShowWindow(g_launcherGroupsDragIndicatorWnd, SW_HIDE);
+        }
         g_launcherGroupsTaskbarDragSeq++;
         EPDebugLogWrite(
             L"launcher-group taskbar drag down seq=%d group=\"%s\" taskbarWnd=%p captureAfter=%p",
@@ -2020,6 +2287,8 @@ BOOL LauncherGroups_FinishTaskbarDrag()
     g_launcherGroupsDragGroup = NULL;
     g_launcherGroupsDragDropTarget = NULL;
     g_launcherGroupsDragMoved = FALSE;
+    // 交换发生在改键名之后窗口重建之前，指示器必须先藏起来。
+    LauncherGroups_HideDragIndicator();
     if (g_launcherGroupsTaskbarWnd)
     {
         ReleaseCapture();

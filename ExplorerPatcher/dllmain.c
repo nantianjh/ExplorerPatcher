@@ -930,11 +930,6 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_RELOAD_MSG (WM_APP + 0x513)
 #define EP_LAUNCHER_GROUP_SHOW_APPS_MSG (WM_APP + 0x514)
 #define EP_LAUNCHER_GROUP_VIEWMODE_MSG (WM_APP + 0x515)
-// 换位后按注册表顺序销毁并重建全部分组窗口：
-// 任务栏按钮是分组窗口（自建顶层窗口 + AppUserModelID）的任务项投影，
-// 按钮排列跟随窗口出现顺序，改注册表或合成拖动都不会让任务栏重排；
-// 只有让窗口按新顺序重新出现，按钮顺序才会变。
-#define EP_LAUNCHER_GROUP_REBUILD_MSG (WM_APP + 0x516)
 #define EP_LAUNCHER_GROUP_LISTVIEW_ID 1000
 #define EP_LAUNCHER_GROUP_MENU_RENAME 2101
 #define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
@@ -2103,96 +2098,15 @@ void LauncherGroups_HideDragIndicator()
     }
 }
 
-// ─────────── 按注册表顺序重建分组窗口：让任务栏按钮真正重排 ───────────
-// 用户澄清 + 代码证实（用户反馈是关键）：任务栏上的分组按钮是 **EP 自建
-// 顶层窗口的任务项投影**（CreateWindowForLoadedGroups 建窗在 -32000,
-// -32000 屏幕外，设置 WS_EX_APPWINDOW + AppUserModelID 后任务栏为其
-// 生成按钮，见 5729 行）。任务栏按钮顺序跟随**窗口出现顺序**。
-// 由此定案三件事：
-//   1. SwapGroupOrder 改注册表键序只影响下次建窗顺序，当前按钮不动；
-//   2. 合成系统拖动（上一提交）已被实测证伪：任务栏对"运行任务按钮"
-//      的合成拖放有动画但不落位（用户 16:20 反馈"有换位动画但无实际变化"）；
-//   3. 唯一正路 = 换位后按新注册表顺序**销毁并重建全部分组窗口**，
-//      让按钮按新出现顺序重新排列。这也正是注册表键序机制的设计本意。
-// 重建必须在分组窗口所属线程（LauncherGroupsThread）执行：
-// DestroyWindow/CreateWindow 都要求创建线程，钩子线程只负责 PostThreadMessage。
-
-// 销毁全部分组窗口。WM_DESTROY 已负责清理 ListView 子类、DropTargets、图像列表。
-void LauncherGroups_DestroyAllGroupWindows()
-{
-    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
-    {
-        if (group->hWnd && IsWindow(group->hWnd))
-        {
-            DestroyWindow(group->hWnd);
-        }
-        group->hWnd = NULL;
-        group->bAppsVisible = FALSE;
-    }
-    EPDebugLogWrite(L"launcher-group windows destroyed for rebuild");
-}
-
-// 把 g_launcherGroups 链表按注册表当前枚举顺序重新链接。
-// CreateWindowsForLoadedGroups 按链表顺序建窗 → 链表序 = 按钮序。
-void LauncherGroups_ReorderGroupsToRegistryOrder()
-{
-    HKEY hRoot = NULL;
-    LauncherGroup* newHead = NULL;
-    LauncherGroup* newTail = NULL;
-    DWORD index = 0;
-
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
-    {
-        return;
-    }
-    while (TRUE)
-    {
-        WCHAR szSubKey[128];
-        DWORD cchSubKey = ARRAYSIZE(szSubKey);
-        LauncherGroup** pp = &g_launcherGroups;
-
-        if (RegEnumKeyExW(hRoot, index++, szSubKey, &cchSubKey, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
-        {
-            break;
-        }
-        while (*pp && wcscmp((*pp)->szKeyName, szSubKey) != 0)
-        {
-            pp = &(*pp)->next;
-        }
-        if (*pp)
-        {
-            LauncherGroup* node = *pp;
-            *pp = node->next;
-            node->next = NULL;
-            if (newTail)
-            {
-                newTail->next = node;
-            }
-            else
-            {
-                newHead = node;
-            }
-            newTail = node;
-        }
-    }
-    RegCloseKey(hRoot);
-
-    // 注册表里已不存在的残留分组（理论上没有）保留在尾部，防止丢窗口。
-    if (g_launcherGroups)
-    {
-        if (newTail)
-        {
-            newTail->next = g_launcherGroups;
-        }
-        else
-        {
-            newHead = g_launcherGroups;
-        }
-        g_launcherGroups = NULL;
-    }
-    g_launcherGroups = newHead;
-    EPDebugLogWrite(L"launcher-group chain reordered to registry order");
-}
+// ─────────── 分组窗口与任务栏按钮的关系（实测定案，勿再走弯路） ───────────
+// 任务栏按钮是分组窗口（自建顶层窗口 + WS_EX_APPWINDOW + AppUserModelID）的
+// 任务项投影。任务栏按钮的**屏幕排列**经三种路径实测均不可程序化控制：
+//   ① 改注册表键序 → 按钮不动（任务栏不读它排按钮）；
+//   ② 合成系统拖动（SendInput）→ 有动画不落位；
+//   ③ 销毁重建分组窗口 → 分组间相对顺序不变，且分组按钮被挤到普通任务
+//      按钮后面、普通任务顶到最左端（用户明确拒绝此副作用，方案已撤）。
+// 结论：任务栏对运行任务按钮的排序无公开可控入口。注册表键序仅决定
+// explorer 启动时的建窗顺序（即冷启动时的初始按钮顺序）。
 
 BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
 {
@@ -2397,14 +2311,12 @@ BOOL LauncherGroups_FinishTaskbarDrag()
         // "拖不动、松手像误触菜单"观感的来源。
         if (dragged && target && dragged != target)
         {
+            // 仅交换注册表键序（持久化）。任务栏按钮的屏幕排列经三种路径实测
+            // 均不可程序化控制：① 改注册表（按钮不动）；② 合成系统拖动
+            // （有动画不落位）；③ 销毁重建分组窗口（分组相对顺序不变，且会把
+            // 分组按钮挤到普通任务按钮后面，普通任务顶到最左端 —— 用户明确
+            // 拒绝此副作用）。在找到不产生该副作用的机制前，屏幕重排不做。
             LauncherGroups_SwapGroupOrder(dragged, target);
-            // 按新注册表顺序销毁并重建全部分组窗口：任务栏按钮是分组窗口的
-            // 任务项投影，顺序跟随窗口出现顺序，只有重建才能让按钮重排。
-            // 必须发给分组线程执行（DestroyWindow/CreateWindow 要求创建线程）。
-            if (g_launcherGroupsThreadId)
-            {
-                PostThreadMessageW(g_launcherGroupsThreadId, EP_LAUNCHER_GROUP_REBUILD_MSG, 0, 0);
-            }
         }
         return TRUE;
     }
@@ -5769,16 +5681,6 @@ DWORD LauncherGroupsThread(DWORD unused)
         {
             EPDebugLogWrite(L"launcher-groups reload");
             LauncherGroups_LoadFromRegistry();
-            LauncherGroups_CreateWindowsForLoadedGroups();
-            continue;
-        }
-        if (msg.message == EP_LAUNCHER_GROUP_REBUILD_MSG)
-        {
-            // 换位后的重排：销毁全部分组窗口 → 链表按注册表顺序重链 → 重建。
-            // 重建顺序 = 窗口出现顺序 = 任务栏按钮顺序（按钮是分组窗口的任务项投影）。
-            EPDebugLogWrite(L"launcher-groups rebuild for order");
-            LauncherGroups_DestroyAllGroupWindows();
-            LauncherGroups_ReorderGroupsToRegistryOrder();
             LauncherGroups_CreateWindowsForLoadedGroups();
             continue;
         }

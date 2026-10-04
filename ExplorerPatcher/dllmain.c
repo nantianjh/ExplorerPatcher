@@ -1050,6 +1050,7 @@ DWORD g_launcherGroupsItemSpacing = 100;
 BOOL g_launcherGroupsDragActive = FALSE;
 LauncherGroup* g_launcherGroupsDragGroup = NULL;
 LauncherGroup* g_launcherGroupsDragDropTarget = NULL;
+LauncherGroup* g_launcherGroupsPendingMenuGroup = NULL;
 POINT g_launcherGroupsDragStartPt = { 0, 0 };
 HWND g_launcherGroupsTaskbarWnd = NULL;
 
@@ -1905,7 +1906,9 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
         // 捕获到鼠标所在的任务栏窗口，保证移出任务栏后仍能收到 LBUTTONUP
         g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
         SetCapture(g_launcherGroupsTaskbarWnd);
-        PostMessageW(group->hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+        // 暂不弹菜单：若立即弹出，用户刚开始拖动就会被菜单打断。
+        // 改为在"释放时未发生拖动"的情况下补弹菜单。
+        g_launcherGroupsPendingMenuGroup = group;
     }
     return TRUE;
 }
@@ -1914,18 +1917,39 @@ BOOL LauncherGroups_FinishTaskbarDrag()
 {
     LauncherGroup* dragged = g_launcherGroupsDragGroup;
     LauncherGroup* target = g_launcherGroupsDragDropTarget;
+    LauncherGroup* pendingMenu = g_launcherGroupsPendingMenuGroup;
+    POINT startPt = g_launcherGroupsDragStartPt;
+    POINT releasePt;
+    LONG dx;
+    LONG dy;
+
+    GetCursorPos(&releasePt);
+    dx = releasePt.x - startPt.x;
+    dy = releasePt.y - startPt.y;
 
     g_launcherGroupsDragActive = FALSE;
     g_launcherGroupsDragGroup = NULL;
     g_launcherGroupsDragDropTarget = NULL;
+    g_launcherGroupsPendingMenuGroup = NULL;
     if (g_launcherGroupsTaskbarWnd)
     {
         ReleaseCapture();
     }
 
-    if (dragged && target && dragged != target)
+    if (dx * dx + dy * dy > 16)
     {
-        LauncherGroups_SwapGroupOrder(dragged, target);
+        // 确实发生了拖动
+        if (dragged && target && dragged != target)
+        {
+            LauncherGroups_SwapGroupOrder(dragged, target);
+        }
+        return TRUE;
+    }
+
+    // 未拖动（等同普通左键点击）→ 补弹分组菜单
+    if (pendingMenu && pendingMenu->hWnd && IsWindow(pendingMenu->hWnd))
+    {
+        PostMessageW(pendingMenu->hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
     }
     return TRUE;
 }

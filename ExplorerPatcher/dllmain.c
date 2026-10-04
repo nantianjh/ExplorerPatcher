@@ -965,6 +965,15 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_MENU_FONTSCALE_DOWN 2161
 #define EP_LAUNCHER_GROUP_MENU_FONTSCALE_RESET 2162
 #define EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM 2163
+#define EP_LAUNCHER_GROUP_SPACING_VALUE L"LauncherGroupsItemSpacing"
+#define EP_LAUNCHER_GROUP_SPACING_DEFAULT 100
+#define EP_LAUNCHER_GROUP_SPACING_MIN 50
+#define EP_LAUNCHER_GROUP_SPACING_MAX 300
+#define EP_LAUNCHER_GROUP_SPACING_STEP 10
+#define EP_LAUNCHER_GROUP_MENU_SPACING_UP 2180
+#define EP_LAUNCHER_GROUP_MENU_SPACING_DOWN 2181
+#define EP_LAUNCHER_GROUP_MENU_SPACING_RESET 2182
+#define EP_LAUNCHER_GROUP_MENU_SPACING_CUSTOM 2183
 
 typedef enum _LauncherGroupsViewMode
 {
@@ -1036,6 +1045,13 @@ DWORD g_launcherGroupsLastMouseCheckTick = 0;
 DWORD g_launcherGroupsViewMode = LAUNCHER_GROUP_VIEW_LIST;
 DWORD g_launcherGroupsColumnsPerRow = EP_LAUNCHER_GROUP_COLUMNS_DEFAULT;
 DWORD g_launcherGroupsFontScale = 100;
+int g_launcherGroupsGlobalLabelWidth = 0;
+DWORD g_launcherGroupsItemSpacing = 100;
+BOOL g_launcherGroupsDragActive = FALSE;
+LauncherGroup* g_launcherGroupsDragGroup = NULL;
+LauncherGroup* g_launcherGroupsDragDropTarget = NULL;
+POINT g_launcherGroupsDragStartPt = { 0, 0 };
+HWND g_launcherGroupsTaskbarWnd = NULL;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -1045,6 +1061,10 @@ void LauncherGroups_RegisterDropTargets(LauncherGroup* group);
 void LauncherGroups_RevokeDropTargets(LauncherGroup* group);
 void LauncherGroups_SetAppUserModelId(LauncherGroup* group);
 void LauncherGroups_AlignColumnsToSetting(LauncherGroup* group, int columns, int spacingCx);
+BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR newName);
+BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarget);
+BOOL LauncherGroups_FinishTaskbarDrag();
+void LauncherGroups_RecalcGlobalCellWidth();
 
 BOOL LauncherGroups_EnsureItemCapacity(LauncherGroup* group, DWORD cItemsNeeded)
 {
@@ -1810,6 +1830,19 @@ BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
     DWORD tick = GetTickCount();
     LauncherGroup* group;
 
+    if (g_launcherGroupsDragActive && g_launcherGroupsDragGroup)
+    {
+        //拖动分组到另一分组上时记录目标，释放后交换位置
+        LONG dx = pt.x - g_launcherGroupsDragStartPt.x;
+        LONG dy = pt.y - g_launcherGroupsDragStartPt.y;
+        if (dx * dx + dy * dy > 16)
+        {
+            LauncherGroup* target = LauncherGroups_FindGroupAtPoint(pt);
+            g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
+        }
+        return TRUE;
+    }
+
     if (g_launcherGroupsLastMouseCheckTick
         && tick - g_launcherGroupsLastMouseCheckTick < 80)
     {
@@ -1861,7 +1894,38 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
 
     if (bButtonDown)
     {
+        if (GetKeyState(VK_ESCAPE) < 0)
+        {
+            return TRUE;
+        }
+        g_launcherGroupsDragGroup = group;
+        g_launcherGroupsDragDropTarget = NULL;
+        g_launcherGroupsDragStartPt = pt;
+        g_launcherGroupsDragActive = TRUE;
+        // 捕获到鼠标所在的任务栏窗口，保证移出任务栏后仍能收到 LBUTTONUP
+        g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
+        SetCapture(g_launcherGroupsTaskbarWnd);
         PostMessageW(group->hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+    }
+    return TRUE;
+}
+
+BOOL LauncherGroups_FinishTaskbarDrag()
+{
+    LauncherGroup* dragged = g_launcherGroupsDragGroup;
+    LauncherGroup* target = g_launcherGroupsDragDropTarget;
+
+    g_launcherGroupsDragActive = FALSE;
+    g_launcherGroupsDragGroup = NULL;
+    g_launcherGroupsDragDropTarget = NULL;
+    if (g_launcherGroupsTaskbarWnd)
+    {
+        ReleaseCapture();
+    }
+
+    if (dragged && target && dragged != target)
+    {
+        LauncherGroups_SwapGroupOrder(dragged, target);
     }
     return TRUE;
 }
@@ -2171,8 +2235,7 @@ BOOL LauncherGroups_WriteFontScaleToRegistry(DWORD scale)
     return ok;
 }
 
-void LauncherGroups_SetFontScale(DWORD scale)
-{
+void LauncherGroups_SetFontScale(DWORD scale){
     scale = LauncherGroups_ClampFontScale(scale);
     if (g_launcherGroupsFontScale == scale)
     {
@@ -2186,6 +2249,98 @@ void LauncherGroups_SetFontScale(DWORD scale)
         scale,
         LauncherGroups_WriteFontScaleToRegistry(scale)
     );
+}
+
+DWORD LauncherGroups_ClampItemSpacing(DWORD spacing)
+{
+    if (spacing < EP_LAUNCHER_GROUP_SPACING_MIN)
+    {
+        return EP_LAUNCHER_GROUP_SPACING_DEFAULT;
+    }
+    if (spacing > EP_LAUNCHER_GROUP_SPACING_MAX)
+    {
+        return EP_LAUNCHER_GROUP_SPACING_MAX;
+    }
+    return spacing;
+}
+
+void LauncherGroups_ReadItemSpacingFromRegistry()
+{
+    HKEY hKey = NULL;
+    DWORD spacing = EP_LAUNCHER_GROUP_SPACING_DEFAULT;
+    DWORD cb = sizeof(spacing);
+    DWORD type = REG_DWORD;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        RegQueryValueExW(hKey, EP_LAUNCHER_GROUP_SPACING_VALUE, NULL, &type, (BYTE*)&spacing, &cb);
+        RegCloseKey(hKey);
+    }
+    g_launcherGroupsItemSpacing = LauncherGroups_ClampItemSpacing(spacing);
+}
+
+BOOL LauncherGroups_WriteItemSpacingToRegistry(DWORD spacing)
+{
+    HKEY hKey = NULL;
+    BOOL ok = FALSE;
+
+    spacing = LauncherGroups_ClampItemSpacing(spacing);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, TEXT(REGPATH), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        ok = RegSetValueExW(hKey, EP_LAUNCHER_GROUP_SPACING_VALUE, 0, REG_DWORD, (const BYTE*)&spacing, sizeof(spacing)) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+    }
+    return ok;
+}
+
+void LauncherGroups_SetItemSpacing(DWORD spacing)
+{
+    spacing = LauncherGroups_ClampItemSpacing(spacing);
+    if (g_launcherGroupsItemSpacing == spacing)
+    {
+        return;
+    }
+
+    g_launcherGroupsItemSpacing = spacing;
+    LauncherGroups_PostColumnsChanged();
+    EPDebugLogWrite(
+        L"launcher-groups set item spacing=%lu saved=%d",
+        spacing,
+        LauncherGroups_WriteItemSpacingToRegistry(spacing)
+    );
+}
+
+int LauncherGroups_PromptForItemSpacing(LauncherGroup* group)
+{
+    WCHAR answer[16];
+    WCHAR defaultValue[16];
+    WCHAR prompt[128];
+    BOOL cancelled = FALSE;
+
+    if (!group)
+    {
+        return 0;
+    }
+
+    swprintf_s(defaultValue, ARRAYSIZE(defaultValue), L"%lu", g_launcherGroupsItemSpacing);
+    swprintf_s(prompt, ARRAYSIZE(prompt), L"\u8BF7\u8F93\u5165\u9879\u76EE\u95F4\u8DDD\u767E\u5206\u6BD4\uFF08%d - %d\uFF09",
+        EP_LAUNCHER_GROUP_SPACING_MIN, EP_LAUNCHER_GROUP_SPACING_MAX);
+
+    group->bKeepVisibleForModal = TRUE;
+    HRESULT hrInput = InputBox(FALSE, group->hWnd, prompt, L"\u9879\u76EE\u95F4\u8DDD", defaultValue, answer, ARRAYSIZE(answer), &cancelled);
+    group->bKeepVisibleForModal = FALSE;
+    if (FAILED(hrInput) || cancelled || !answer[0])
+    {
+        return 0;
+    }
+
+    WCHAR* end = NULL;
+    long value = wcstol(answer, &end, 10);
+    if (end == answer || value < EP_LAUNCHER_GROUP_SPACING_MIN || value > EP_LAUNCHER_GROUP_SPACING_MAX)
+    {
+        return 0;
+    }
+    return (int)value;
 }
 
 int LauncherGroups_PromptForFontScale(LauncherGroup* group)
@@ -2294,6 +2449,7 @@ int LauncherGroups_MeasureAppsLabelWidth(LauncherGroup* group, int iconSize)
     RECT rc;
     LONG widest = 0;
     int iCount = 8;
+    HFONT hFontUse;
 
     if (!group)
     {
@@ -2306,7 +2462,8 @@ int LauncherGroups_MeasureAppsLabelWidth(LauncherGroup* group, int iconSize)
         return 0;
     }
 
-    hFontOld = (HFONT)SelectObject(hdc, group->hFont ? group->hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+    hFontUse = group->hFont ? group->hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    hFontOld = (HFONT)SelectObject(hdc, hFontUse);
 
     for (DWORD i = 0; i < group->cItems && iCount > 0; i++)
     {
@@ -2333,6 +2490,70 @@ int LauncherGroups_MeasureAppsLabelWidth(LauncherGroup* group, int iconSize)
 
     // 留一点余量，避免刚好卡在临界值导致换行抖动
     return (int)widest + MulDiv(4, iconSize, 48);
+}
+
+// 单元格宽度必须全局一致，否则各分组窗口宽度各异（同一"每行 N 个"下大小不同）。
+// 遍历所有分组取最宽标签作为统一基准。
+void LauncherGroups_RecalcGlobalCellWidth()
+{
+    int widest = 0;
+    HFONT hFont = NULL;
+    HDC hdc = NULL;
+    HFONT hFontOld = NULL;
+    HWND hMeasureWnd = NULL;
+    RECT rc;
+    int iconSize = LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode);
+
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        if (!group->hWnd || !IsWindow(group->hWnd))
+        {
+            continue;
+        }
+
+        hMeasureWnd = group->hWnd;
+        hFont = group->hFont ? group->hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        break;
+    }
+
+    if (!hMeasureWnd)
+    {
+        return;
+    }
+
+    hdc = GetDC(hMeasureWnd);
+    if (!hdc)
+    {
+        return;
+    }
+    hFontOld = (HFONT)SelectObject(hdc, hFont);
+
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        for (DWORD i = 0; i < group->cItems; i++)
+        {
+            LONG w;
+            if (!group->items[i].szName[0])
+            {
+                continue;
+            }
+            SetRect(&rc, 0, 0, 0, 0);
+            DrawTextW(hdc, group->items[i].szName, -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+            w = rc.right - rc.left;
+            if (w > widest)
+            {
+                widest = w;
+            }
+        }
+    }
+
+    SelectObject(hdc, hFontOld);
+    ReleaseDC(hMeasureWnd, hdc);
+
+    if (widest > 0)
+    {
+        g_launcherGroupsGlobalLabelWidth = widest + MulDiv(4, iconSize, 48);
+    }
 }
 
 BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidth, int* pColumns, int* pRows, int* pCellCx, int* pCellCy, int* pPaddingCx, int* pPaddingCy)
@@ -2380,11 +2601,22 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidt
 
     // ListView 图标模式每项占位 = max(图标宽, 标签实测宽) + 图标间距，
     // 单元格宽度必须不小于该值，否则每行放不下设定列数。
+    // labelWidth 统一取全局最宽标签（各分组一致），spacing 为用户自定义的项目间隔百分比。
     cellCx = baseCx;
     if (labelWidth > 0)
     {
         int labelBased = labelWidth + MulDiv(8, iconSize, baseCx);
         cellCx = max(cellCx, labelBased);
+    }
+    if (g_launcherGroupsItemSpacing != EP_LAUNCHER_GROUP_SPACING_DEFAULT)
+    {
+        int gapExtra = MulDiv(cellCx - iconSize, (int)g_launcherGroupsItemSpacing - 100, 100);
+        cellCx = cellCx + gapExtra;
+        if (cellCx < iconSize + MulDiv(24, iconSize, 48))
+        {
+            cellCx = iconSize + MulDiv(24, iconSize, 48);
+        }
+        cellCy += gapExtra;
     }
 
     columns = max(1, columns);
@@ -2619,7 +2851,9 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
 
     size.cx = 300;
     size.cy = 160;
-    labelWidth = LauncherGroups_MeasureAppsLabelWidth(group, iconSize);
+    labelWidth = g_launcherGroupsGlobalLabelWidth > 0
+        ? g_launcherGroupsGlobalLabelWidth
+        : LauncherGroups_MeasureAppsLabelWidth(group, iconSize);
     if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, labelWidth, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy))
     {
         size.cx = columns * cellCx + paddingCx;
@@ -2781,7 +3015,9 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
     if (LauncherGroups_GetAppsIconLayout(
         g_launcherGroupsViewMode,
         group->cItems ? group->cItems : 1,
-        LauncherGroups_MeasureAppsLabelWidth(group, LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode)),
+        g_launcherGroupsGlobalLabelWidth > 0
+            ? g_launcherGroupsGlobalLabelWidth
+            : LauncherGroups_MeasureAppsLabelWidth(group, LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode)),
         &columns,
         &rows,
         &spacingCx,
@@ -3219,6 +3455,245 @@ BOOL LauncherGroups_RenameRegistryGroup(LauncherGroup* group)
     }
     LauncherGroups_PostReload();
     EPDebugLogWrite(L"launcher-group rename old=\"%s\" new=\"%s\" ok=%d", oldName, newName, ok);
+    return ok;
+}
+
+// 重命名注册表子键：先把源键（含其全部子值）复制到临时键，删除源键，
+// 再把临时键改名为目标键名。RegRenameKey 在部分系统上不可用，故用复制+删除实现。
+BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR newName)
+{
+    HKEY hOld = NULL;
+    HKEY hNew = NULL;
+    HKEY hSrc = NULL;
+    HKEY hDst = NULL;
+    DWORD index = 0;
+    BOOL ok = FALSE;
+
+    if (!hRoot || !oldName || !newName || !wcscmp(oldName, newName))
+    {
+        return FALSE;
+    }
+
+    if (RegOpenKeyExW(hRoot, newName, 0, KEY_READ, &hNew) == ERROR_SUCCESS)
+    {
+        RegCloseKey(hNew);
+        return FALSE; // 目标名已存在，避免覆盖数据
+    }
+
+    if (RegOpenKeyExW(hRoot, oldName, 0, KEY_READ | KEY_WRITE, &hOld) != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    if (RegCreateKeyExW(hRoot, newName, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hNew, NULL) != ERROR_SUCCESS)
+    {
+        RegCloseKey(hOld);
+        return FALSE;
+    }
+
+    // 复制所有值
+    while (TRUE)
+    {
+        WCHAR valueName[256];
+        DWORD cchName = ARRAYSIZE(valueName);
+        DWORD type = 0;
+        BYTE data[4096];
+        DWORD cbData = sizeof(data);
+
+        if (RegEnumValueW(hOld, index++, valueName, &cchName, NULL, &type, data, &cbData) != ERROR_SUCCESS)
+        {
+            break;
+        }
+
+        if (cchName == 0)
+        {
+            // 默认值
+            valueName[0] = L'\0';
+        }
+        RegSetValueExW(hNew, valueName, 0, type, data, cbData);
+    }
+
+    // 复制子键（本实现不使用嵌套，但保持完整性）
+    index = 0;
+    while (TRUE)
+    {
+        WCHAR subName[128];
+        DWORD cchSub = ARRAYSIZE(subName);
+
+        if (RegEnumKeyExW(hOld, index++, subName, &cchSub, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+        {
+            break;
+        }
+
+        if (RegOpenKeyExW(hOld, subName, 0, KEY_READ, &hSrc) == ERROR_SUCCESS)
+        {
+            if (RegCreateKeyExW(hNew, subName, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hDst, NULL) == ERROR_SUCCESS)
+            {
+                DWORD valueIndex = 0;
+                while (TRUE)
+                {
+                    WCHAR valueName[256];
+                    DWORD cchName = ARRAYSIZE(valueName);
+                    DWORD type = 0;
+                    BYTE data[4096];
+                    DWORD cbData = sizeof(data);
+
+                    if (RegEnumValueW(hSrc, valueIndex++, valueName, &cchName, NULL, &type, data, &cbData) != ERROR_SUCCESS)
+                    {
+                        break;
+                    }
+                    if (cchName == 0)
+                    {
+                        valueName[0] = L'\0';
+                    }
+                    RegSetValueExW(hDst, valueName, 0, type, data, cbData);
+                }
+                RegCloseKey(hDst);
+            }
+            RegCloseKey(hSrc);
+        }
+    }
+
+    RegCloseKey(hNew);
+    RegDeleteKeyExW(hRoot, oldName, 0, 0);
+    RegCloseKey(hOld);
+    ok = TRUE;
+    return ok;
+}
+
+// 分组在任务栏上的先后顺序由注册表子键的枚举顺序决定。
+// 换位置的做法：把注册表里各子键按目标顺序重命名一遍（枚举顺序即由键名决定），
+// 键名本身仅作存储用、显示名称取子键下的 "Name" 值，因此改键名不影响用户可见名称。
+// 全部改名完成后再重载，让新顺序生效。
+BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarget)
+{
+    HKEY hKey = NULL;
+    int indexDrag = -1;
+    int indexTarget = -1;
+    int total = 0;
+    int idx = 0;
+    int i;
+    WCHAR(*keys)[128] = NULL;
+    WCHAR(*temps)[128] = NULL;
+    BOOL ok = FALSE;
+
+    if (!pDragged || !pTarget || pDragged == pTarget || !pDragged->szKeyName[0] || !pTarget->szKeyName[0])
+    {
+        return FALSE;
+    }
+
+    for (LauncherGroup* g = g_launcherGroups; g; g = g->next)
+    {
+        if (g == pDragged)
+        {
+            indexDrag = idx;
+        }
+        if (g == pTarget)
+        {
+            indexTarget = idx;
+        }
+        idx++;
+        total++;
+    }
+
+    if (total < 2 || indexDrag < 0 || indexTarget < 0 || indexDrag == indexTarget)
+    {
+        return FALSE;
+    }
+
+    keys = (WCHAR(*)[128])calloc(total, sizeof(WCHAR) * 128);
+    temps = (WCHAR(*)[128])calloc(total, sizeof(WCHAR) * 128);
+    if (!keys || !temps)
+    {
+        free(keys);
+        free(temps);
+        return FALSE;
+    }
+
+    // 记录当前顺序的键名，并计算目标顺序
+    idx = 0;
+    for (LauncherGroup* g = g_launcherGroups; g; g = g->next, idx++)
+    {
+        LauncherGroups_CopyString(keys[idx], 128, g->szKeyName);
+    }
+
+    // 构造目标顺序：取出被拖动组，插入到目标组位置
+    {
+        WCHAR dragged[128];
+        int insertAt = indexDrag < indexTarget ? indexTarget : indexTarget;
+        int write = 0;
+        int read;
+
+        LauncherGroups_CopyString(dragged, ARRAYSIZE(dragged), keys[indexDrag]);
+
+        for (read = 0; read < total; read++)
+        {
+            if (read == indexDrag)
+            {
+                continue;
+            }
+            if (write == insertAt)
+            {
+                LauncherGroups_CopyString(keys[write], 128, dragged);
+                write++;
+            }
+            LauncherGroups_CopyString(keys[write], 128, keys[read]);
+            write++;
+        }
+        if (write == insertAt)
+        {
+            LauncherGroups_CopyString(keys[write], 128, dragged);
+        }
+    }
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_WRITE | KEY_READ, &hKey) != ERROR_SUCCESS)
+    {
+        free(keys);
+        free(temps);
+        return FALSE;
+    }
+
+    // 第一步：全部改到临时名，避免互相覆盖
+    // 临时名加"~EP_TMP_"前缀，枚举时排到原有键之后，避免中途影响显示名称读取
+    for (i = 0; i < total; i++)
+    {
+        swprintf_s(temps[i], 128, L"~EP_TMP_%d", i);
+        if (!LauncherGroups_RenameRegistrySubKey(hKey, keys[i], temps[i]))
+        {
+            RegCloseKey(hKey);
+            free(keys);
+            free(temps);
+            return FALSE;
+        }
+    }
+
+    // 第二步：临时名改为目标顺序下的键名
+    for (i = 0; i < total; i++)
+    {
+        if (!LauncherGroups_RenameRegistrySubKey(hKey, temps[i], keys[i]))
+        {
+            RegCloseKey(hKey);
+            free(keys);
+            free(temps);
+            return FALSE;
+        }
+    }
+
+    ok = TRUE;
+    RegCloseKey(hKey);
+    free(keys);
+    free(temps);
+
+    if (ok)
+    {
+        LauncherGroups_PostReload();
+        EPDebugLogWrite(
+            L"launcher-group swap order from=%d to=%d total=%d",
+            indexDrag,
+            indexTarget,
+            total
+        );
+    }
     return ok;
 }
 
@@ -3842,6 +4317,7 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
     HMENU hViewMenu;
     HMENU hArrangeMenu;
     HMENU hFontMenu;
+    HMENU hSpacingMenu;
     POINT pt;
     int cmd;
     HWND hSourceWnd;
@@ -3916,6 +4392,22 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
         AppendMenuW(hFontMenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hFontMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_FONTSCALE_CUSTOM, L"\u81EA\u5B9A\u4E49\u6BD4\u4F8B...");
         AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hFontMenu, L"\u6587\u5B57\u5927\u5C0F");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
+
+    hSpacingMenu = CreatePopupMenu();
+    if (hSpacingMenu)
+    {
+        WCHAR spacingText[64];
+        swprintf_s(spacingText, ARRAYSIZE(spacingText), L"\u9879\u76EE\u95F4\u8DDD\uFF08\u5F53\u524D %lu%%\uFF09", g_launcherGroupsItemSpacing);
+        AppendMenuW(hSpacingMenu, MF_STRING | MF_GRAYED, 0, spacingText);
+        AppendMenuW(hSpacingMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hSpacingMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_SPACING_UP, L"\u589E\u5927\u95F4\u8DDD\uFF08+10%\uFF09");
+        AppendMenuW(hSpacingMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_SPACING_DOWN, L"\u7F29\u5C0F\u95F4\u8DDD\uFF08-10%\uFF09");
+        AppendMenuW(hSpacingMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_SPACING_RESET, L"\u6062\u590D\u9ED8\u8BA4\uFF08100%\uFF09");
+        AppendMenuW(hSpacingMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hSpacingMenu, MF_STRING, EP_LAUNCHER_GROUP_MENU_SPACING_CUSTOM, L"\u81EA\u5B9A\u4E49\u6BD4\u4F8B...");
+        AppendMenuW(hMenu, MF_POPUP | MF_STRING, (UINT_PTR)hSpacingMenu, L"\u9879\u76EE\u95F4\u8DDD");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
 
@@ -4046,6 +4538,43 @@ void LauncherGroups_ShowSettingsMenu(HWND hWnd, LauncherGroup* group)
             if (group->bAppsVisible)
             {
                 LauncherGroups_PositionAppsWindow(group);
+            }
+        }
+    }
+    else if (cmd >= EP_LAUNCHER_GROUP_MENU_SPACING_UP && cmd <= EP_LAUNCHER_GROUP_MENU_SPACING_CUSTOM)
+    {
+        BOOL bChanged = FALSE;
+
+        if (cmd == EP_LAUNCHER_GROUP_MENU_SPACING_UP)
+        {
+            LauncherGroups_SetItemSpacing(LauncherGroups_ClampItemSpacing(g_launcherGroupsItemSpacing + EP_LAUNCHER_GROUP_SPACING_STEP));
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_SPACING_DOWN)
+        {
+            LauncherGroups_SetItemSpacing(LauncherGroups_ClampItemSpacing(g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_STEP));
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_SPACING_RESET)
+        {
+            LauncherGroups_SetItemSpacing(EP_LAUNCHER_GROUP_SPACING_DEFAULT);
+            bChanged = TRUE;
+        }
+        else if (cmd == EP_LAUNCHER_GROUP_MENU_SPACING_CUSTOM)
+        {
+            int custom = LauncherGroups_PromptForItemSpacing(group);
+            if (custom > 0)
+            {
+                LauncherGroups_SetItemSpacing((DWORD)custom);
+                bChanged = TRUE;
+            }
+        }
+
+        if (bChanged)
+        {
+            for (LauncherGroup* g = g_launcherGroups; g; g = g->next)
+            {
+                LauncherGroups_UpdateAppsWindow(g);
             }
         }
     }
@@ -4423,6 +4952,17 @@ void LauncherGroups_CreateWindowsForLoadedGroups()
             EPDebugLogWrite(L"launcher-group window shown hwnd=%p group=\"%s\"", group->hWnd, group->szName);
         }
     }
+
+    // 所有窗口就绪后统一测量全局最宽标签，再按统一单元格宽度重排，
+    // 否则各分组因自身标签长度不同而宽度不一致。
+    LauncherGroups_RecalcGlobalCellWidth();
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
+    {
+        if (group->hWnd)
+        {
+            LauncherGroups_UpdateAppsWindow(group);
+        }
+    }
 }
 
 DWORD LauncherGroupsThread(DWORD unused)
@@ -4440,6 +4980,7 @@ DWORD LauncherGroupsThread(DWORD unused)
     g_launcherGroupsViewMode = LauncherGroups_ReadViewModeFromRegistry();
     LauncherGroups_ReadColumnsFromRegistry();
     LauncherGroups_ReadFontScaleFromRegistry();
+    LauncherGroups_ReadItemSpacingFromRegistry();
 
     ZeroMemory(&icc, sizeof(icc));
     icc.dwSize = sizeof(icc);
@@ -6398,6 +6939,11 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
         }
         else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
         {
+            if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
+            {
+                LauncherGroups_FinishTaskbarDrag();
+                return 1;
+            }
             if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
             {
                 return 1;

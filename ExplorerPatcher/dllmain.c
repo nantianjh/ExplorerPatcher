@@ -1054,6 +1054,7 @@ LauncherGroup* g_launcherGroupsDragDropTarget = NULL;
 LauncherGroup* g_launcherGroupsPendingMenuGroup = NULL;
 POINT g_launcherGroupsDragStartPt = { 0, 0 };
 HWND g_launcherGroupsTaskbarWnd = NULL;
+DWORD g_launcherGroupsLastDragCheckTick = 0;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -1067,6 +1068,7 @@ BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR ne
 BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarget);
 BOOL LauncherGroups_FinishTaskbarDrag();
 void LauncherGroups_RecalcGlobalCellWidth();
+HWND LauncherGroups_GetTaskbarWindowFromPoint(POINT pt);
 
 BOOL LauncherGroups_EnsureItemCapacity(LauncherGroup* group, DWORD cItemsNeeded)
 {
@@ -1652,6 +1654,28 @@ LauncherGroup* LauncherGroups_FindByName(LPCWSTR name)
     return NULL;
 }
 
+// 返回该点所属任务栏的**根窗口**（Shell_TrayWnd / Shell_SecondaryTrayWnd），
+// 找不到返回 NULL。与 IsTaskbarPoint 同一套判断，但返回句柄而非布尔，
+// 供拖动 SetCapture 使用：必须捕获到与钩子同线程的窗口，
+// 否则捕获落入 XAML 子窗口（另一个线程）后，线程钩子收不到 WM_LBUTTONUP。
+HWND LauncherGroups_GetTaskbarWindowFromPoint(POINT pt)
+{
+    HWND hWnd = WindowFromPoint(pt);
+    while (hWnd)
+    {
+        WCHAR className[128];
+        className[0] = L'\0';
+        GetClassNameW(hWnd, className, ARRAYSIZE(className));
+        if (!wcscmp(className, L"Shell_TrayWnd")
+            || !wcscmp(className, L"Shell_SecondaryTrayWnd"))
+        {
+            return hWnd;
+        }
+        hWnd = GetParent(hWnd);
+    }
+    return NULL;
+}
+
 BOOL LauncherGroups_IsTaskbarPoint(POINT pt)
 {
     HWND hWnd = WindowFromPoint(pt);
@@ -1834,12 +1858,17 @@ BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
 
     if (g_launcherGroupsDragActive && g_launcherGroupsDragGroup)
     {
-        //拖动分组到另一分组上时记录目标，释放后交换位置
+        //拖动分组到另一分组上时记录目标，释放后交换位置。
+        //目标查找用 UIA，代价高；拖动中每 40ms 查一次即可，
+        //否则高频 WM_MOUSEMOVE 会把任务栏线程拖垮，鼠标明显发卡。
         LONG dx = pt.x - g_launcherGroupsDragStartPt.x;
         LONG dy = pt.y - g_launcherGroupsDragStartPt.y;
-        if (dx * dx + dy * dy > 16)
+        if (dx * dx + dy * dy > 16
+            && tick - g_launcherGroupsLastDragCheckTick >= 40)
         {
-            LauncherGroup* target = LauncherGroups_FindGroupAtPoint(pt);
+            LauncherGroup* target;
+            g_launcherGroupsLastDragCheckTick = tick;
+            target = LauncherGroups_FindGroupAtPoint(pt);
             g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
         }
         return TRUE;
@@ -1904,8 +1933,15 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
         g_launcherGroupsDragDropTarget = NULL;
         g_launcherGroupsDragStartPt = pt;
         g_launcherGroupsDragActive = TRUE;
-        // 捕获到鼠标所在的任务栏窗口，保证移出任务栏后仍能收到 LBUTTONUP
-        g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
+        // 捕获到任务栏**根窗口**（Shell_TrayWnd），而不是 WindowFromPoint 的直接结果。
+        // 直接结果在 XAML 任务栏上往往是跨线程的子窗口，捕获过去后本线程钩子
+        // 收不到 WM_MOUSEMOVE/WM_LBUTTONUP，拖动就"无响应"。
+        // 根窗口与钩子同线程，消息必然回流到本线程。
+        g_launcherGroupsTaskbarWnd = LauncherGroups_GetTaskbarWindowFromPoint(pt);
+        if (!g_launcherGroupsTaskbarWnd)
+        {
+            g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
+        }
         SetCapture(g_launcherGroupsTaskbarWnd);
         // 暂不弹菜单：若立即弹出，用户刚开始拖动就会被菜单打断。
         // 改为在"释放时未发生拖动"的情况下补弹菜单。
@@ -2628,24 +2664,33 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidt
     // ListView 图标模式每项占位 = max(图标宽, 标签实测宽) + 图标间距，
     // 单元格宽度必须不小于该值，否则每行放不下设定列数。
     // labelWidth 统一取全局最宽标签（各分组一致），spacing 为用户自定义的项目间隔百分比。
-    // 项目间隔（关键修正）：ListView 图标视图会把单元格宽度**下限锁死在标签实测宽度上**。
-    // 旧实现按"整体宽度百分比"缩放（gapExtra = MulDiv(cellCx - iconSize, spacing-100, 100)），
-    // 一旦目标宽度低于标签下限，多出来的差值就被下限吃掉 —— 表现为调小间隔时蓝色高亮框
-    // 纹丝不动（实测恒为 140px =最宽标签 117px + 内边距，与 spacing 取值无关）。
-    // 改为「内容宽 + 可缩放留白」：cellCx 恒 >= 标签下限，故调大/调小都会被 ListView 采纳。
+    // 项目间隔：横向留白直接由间隔百分比决定，且始终叠加在内容宽之上。
+    // （关键约束）ListView 图标视图会把单元格宽度**下限锁死在标签实测宽度上**，
+    // 任何低于该下限的 LVM_SETICONSPACING 请求都会被无声忽略 —— 这正是上一轮
+    // "按整体宽度百分比缩放"调小时完全无响应的根因。
+    // 新映射：MIN(50%) 时留白为 0（单元格=内容宽，最紧），100% 时为半个图标宽，
+    // 300% 时为 2.5 个图标宽。跨度 ~2.5 倍图标宽，肉眼可辨；
+    // 且在 80%（用户当前设置）处恰好还原此前的视觉宽度，不突兀。
     {
         int contentCx = iconSize;
         int baseGap;
+        int gap;
 
         if (labelWidth > 0)
         {
             contentCx = max(contentCx, labelWidth + MulDiv(8, iconSize, baseCx));
         }
         baseGap = max(1, baseCx - iconSize);
-        // 横向：留白随间隔线性缩放，且始终叠加在内容宽之上，故两个方向均可见。
-        cellCx = contentCx + MulDiv(baseGap, (int)g_launcherGroupsItemSpacing, 100);
-        // 纵向沿用比例缩放（纵向本就不受标签宽度下限影响）。
-        cellCy += MulDiv(baseGap, (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_DEFAULT, 100);
+        gap = MulDiv(iconSize,
+            (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_MIN, 100);
+        if (gap < 0)
+        {
+            gap = 0;
+        }
+        cellCx = contentCx + gap;
+        // 纵向沿用比例缩放（纵向不受标签宽度下限影响，原行为可用）。
+        cellCy += MulDiv(baseGap,
+            (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_DEFAULT, 100);
     }
 
     columns = max(1, columns);
@@ -3068,6 +3113,30 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
     LauncherGroups_UpdateWindowSize(group);
     LauncherGroups_AlignColumnsToSetting(group, columns, spacingCx);
     InvalidateRect(group->hListView, NULL, TRUE);
+
+    // 闭环取证：记录"请求的间隔"与 ListView 实际渲染出的单元格宽/列距。
+    // 若两者不一致，说明间隔设置没有真正落到渲染上，日志能直接定位是
+    // 公式算错还是被 ListView 的宽度下限/其他逻辑改写。
+    {
+        RECT rcB0;
+        RECT rcB1;
+        if (ListView_GetItemRect(group->hListView, 0, &rcB0, LVIR_BOUNDS))
+        {
+            int pitch = -1;
+            if (ListView_GetItemRect(group->hListView, 1, &rcB1, LVIR_BOUNDS))
+            {
+                pitch = rcB1.left - rcB0.left;
+            }
+            EPDebugLogWrite(
+                L"launcher-group layout group=\"%s\" spacing=%lu req=%dx%d "
+                L"measuredCell=%dx%d pitch=%d items=%lu",
+                group->szName,
+                g_launcherGroupsItemSpacing,
+                spacingCx, spacingCy,
+                rcB0.right - rcB0.left, rcB0.bottom - rcB0.top,
+                pitch, group->cItems);
+        }
+    }
 }
 
 // 闭环校正：ListView 在图标视图下自行决定换行位置，其实际每行项目数由客户区宽度、
@@ -7046,28 +7115,23 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
     if (nCode == HC_ACTION)
     {
         POINT pt = ((MOUSEHOOKSTRUCT*)lParam)->pt;
-        // WH_MOUSE_LL 是全局钩子，整个系统每次鼠标事件都会进来。
-        // 拖动中必须无条件处理（鼠标可能已移出任务栏），其余情况先做廉价的任务栏点判断。
-        if (g_launcherGroupsDragActive || LauncherGroups_IsTaskbarPoint(pt))
+        if (wParam == WM_MOUSEMOVE || wParam == WM_NCMOUSEMOVE || wParam == WM_MOUSEHOVER || wParam == WM_NCMOUSEHOVER)
         {
-            if (wParam == WM_MOUSEMOVE || wParam == WM_NCMOUSEMOVE || wParam == WM_MOUSEHOVER || wParam == WM_NCMOUSEHOVER)
+            if (LauncherGroups_OnTaskbarMouseMove(pt))
             {
-                if (LauncherGroups_OnTaskbarMouseMove(pt))
-                {
-                    return 1;
-                }
+                return 1;
             }
-            else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
+        }
+        else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
+        {
+            if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
             {
-                if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
-                {
-                    LauncherGroups_FinishTaskbarDrag();
-                    return 1;
-                }
-                if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
-                {
-                    return 1;
-                }
+                LauncherGroups_FinishTaskbarDrag();
+                return 1;
+            }
+            if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
+            {
+                return 1;
             }
         }
     }
@@ -12498,11 +12562,15 @@ HWND CreateWindowExWHook(
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"Shell_TrayWnd"))
     {
         SetWindowSubclass(hWnd, Shell_TrayWndSubclassProc, Shell_TrayWndSubclassProc, TRUE);
-        //必须用 WH_MOUSE_LL（全局低级鼠标钩子）。
-        // 原先的 WH_MOUSE + GetCurrentThreadId() 只对本线程窗口的消息可见，
-        // 一旦鼠标被捕获到别的窗口/线程（XAML 任务栏按钮、拖动过程），钩子就收不到
-        // WM_MOUSEMOVE/WM_LBUTTONUP —— 表现为"按下有效、拖动无反应、松手像点了一下菜单"。
-        Shell_TrayWndMouseHook = SetWindowsHookExW(WH_MOUSE_LL, Shell_TrayWndMouseProc, NULL, 0);
+        // 必须用线程局部 WH_MOUSE，不能用 WH_MOUSE_LL。
+        // WH_MOUSE_LL 是系统输入管线的强制同步点：每个鼠标事件都必须等回调返回，
+        // 而回调里 IsTaskbarPoint（WindowFromPoint+逐层GetClassName）和
+        // FindGroupAtPoint（UIA ElementFromPoint）都是重活 → 全局鼠标被挂起，
+        // 表现为"悬停弹窗后指针锁死数秒，单击才恢复"。
+        // 线程钩子只在消息派发到本线程窗口前被调用一次，不会阻塞输入。
+        // 拖动时收不到 LBUTTONUP 的问题由 GetTaskbarWindowFromPoint + SetCapture 解决：
+        // 捕获到与钩子同线程的任务栏根窗口，消息必然回到本线程。
+        Shell_TrayWndMouseHook = SetWindowsHookExW(WH_MOUSE, Shell_TrayWndMouseProc, NULL, GetCurrentThreadId());
     }
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"Shell_SecondaryTrayWnd"))
     {

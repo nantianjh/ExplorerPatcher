@@ -2098,6 +2098,135 @@ void LauncherGroups_HideDragIndicator()
     }
 }
 
+// ─────────────── 合成系统拖动：让任务栏真正重排按钮 ───────────────
+// 根因（16:04 日志定案）：SwapGroupOrder 只改注册表键枚举顺序，12/12 次成功；
+// 但任务栏按钮的屏幕排列由任务栏自己管理，从不因注册表变化而重排
+// → "换位成功"只存在于日志里，屏幕上从未变过，用户看到的就是"无响应"。
+// 任务栏按钮排序唯一可控入口是任务栏自己的拖放交互（Win11 支持拖动运行按钮排序），
+// 因此松手后由 EP 合成一段 按下→平移→抬起 的 SendInput 序列，
+// 把被拖分组的按钮从原位置拖到目标按钮位置，交给任务栏完成重排。
+// 注册表键序仍然同步交换：重启 explorer 后 CreateWindowsForLoadedGroups
+// 按注册表枚举顺序创建分组窗口，任务栏按钮的初始顺序即恢复为持久化顺序。
+typedef struct _LauncherGroupsSyntheticDragParams
+{
+    RECT rcFrom;
+    RECT rcTo;
+} LauncherGroupsSyntheticDragParams;
+
+static LauncherGroupsSyntheticDragParams g_launcherGroupsSyntheticDragParams;
+// 合成期间钩子必须整体放行：合成的 LBUTTONDOWN 落在分组按钮上，
+// 若仍走拦截逻辑会再次进入 EP 拖动状态，形成递归。volatile 保证跨线程可见。
+volatile BOOL g_launcherGroupsSyntheticDrag = FALSE;
+
+static void LauncherGroups_SyntheticSetCursorPos(LONG x, LONG y, int bAbsolute)
+{
+    INPUT input;
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = bAbsolute
+        ? (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
+        : MOUSEEVENTF_MOVE;
+    if (bAbsolute)
+    {
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int cx = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int cy = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        input.mi.dx = (LONG)((x - vx) * 65535 / (cx > 1 ? cx - 1 : 1));
+        input.mi.dy = (LONG)((y - vy) * 65535 / (cy > 1 ? cy - 1 : 1));
+    }
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static DWORD WINAPI LauncherGroups_SyntheticDragThread(LPVOID lpParam)
+{
+    POINT from;
+    POINT to;
+    INPUT input;
+    int steps = 14;
+    int i;
+
+    from.x = (g_launcherGroupsSyntheticDragParams.rcFrom.left
+        + g_launcherGroupsSyntheticDragParams.rcFrom.right) / 2;
+    from.y = (g_launcherGroupsSyntheticDragParams.rcFrom.top
+        + g_launcherGroupsSyntheticDragParams.rcFrom.bottom) / 2;
+    to.x = (g_launcherGroupsSyntheticDragParams.rcTo.left
+        + g_launcherGroupsSyntheticDragParams.rcTo.right) / 2;
+    to.y = (g_launcherGroupsSyntheticDragParams.rcTo.top
+        + g_launcherGroupsSyntheticDragParams.rcTo.bottom) / 2;
+
+    // 移到被拖按钮中心 → 按下 → 略停（让任务栏进入拖动态）→ 平移 → 抬起
+    LauncherGroups_SyntheticSetCursorPos(from.x, from.y, TRUE);
+    Sleep(30);
+
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    SendInput(1, &input, sizeof(INPUT));
+    Sleep(60);
+
+    for (i = 1; i <= steps; i++)
+    {
+        LONG x = from.x + (to.x - from.x) * i / steps;
+        LONG y = from.y + (to.y - from.y) * i / steps;
+        LauncherGroups_SyntheticSetCursorPos(x, y, TRUE);
+        Sleep(15);
+    }
+    Sleep(60);
+
+    ZeroMemory(&input, sizeof(input));
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(1, &input, sizeof(INPUT));
+
+    g_launcherGroupsSyntheticDrag = FALSE;
+    EPDebugLogWrite(L"launcher-group synthetic drag done from=%ld,%ld to=%ld,%ld",
+        from.x, from.y, to.x, to.y);
+    return 0;
+}
+
+// 松手后启动合成拖动（异步：钩子回调绝不能 Sleep）。
+// 返回 FALSE 表示缓存里找不到按钮矩形（理论上不该发生）。
+static BOOL LauncherGroups_StartSyntheticDrag(LauncherGroup* dragged, LauncherGroup* target)
+{
+    int i;
+    BOOL bFrom = FALSE;
+    BOOL bTo = FALSE;
+
+    for (i = 0; i < g_launcherGroupsTaskbarButtonRectCount; i++)
+    {
+        if (!bFrom && LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName) == dragged)
+        {
+            g_launcherGroupsSyntheticDragParams.rcFrom = g_launcherGroupsTaskbarButtonRects[i].rc;
+            bFrom = TRUE;
+        }
+        if (!bTo && LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName) == target)
+        {
+            g_launcherGroupsSyntheticDragParams.rcTo = g_launcherGroupsTaskbarButtonRects[i].rc;
+            bTo = TRUE;
+        }
+        if (bFrom && bTo)
+        {
+            break;
+        }
+    }
+    if (!bFrom || !bTo
+        || (g_launcherGroupsSyntheticDragParams.rcFrom.left == g_launcherGroupsSyntheticDragParams.rcTo.left
+            && g_launcherGroupsSyntheticDragParams.rcFrom.top == g_launcherGroupsSyntheticDragParams.rcTo.top))
+    {
+        return FALSE;
+    }
+
+    g_launcherGroupsSyntheticDrag = TRUE;
+    EPDebugLogWrite(L"launcher-group synthetic drag start");
+    if (!CreateThread(NULL, 0, LauncherGroups_SyntheticDragThread, NULL, 0, NULL))
+    {
+        g_launcherGroupsSyntheticDrag = FALSE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
 {
     POINT pt;
@@ -2302,6 +2431,10 @@ BOOL LauncherGroups_FinishTaskbarDrag()
         if (dragged && target && dragged != target)
         {
             LauncherGroups_SwapGroupOrder(dragged, target);
+            // 注册表顺序只决定重启后的初始排列；屏幕上的按钮排列由任务栏管理，
+            // 必须合成一次系统拖动让任务栏自己重排，否则用户看到的仍是原顺序
+            // （16:04 日志：12/12 次 swap 成功，屏幕纹丝不动）。
+            LauncherGroups_StartSyntheticDrag(dragged, target);
         }
         return TRUE;
     }
@@ -7575,6 +7708,13 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
     _In_ LPARAM lParam
 )
 {
+    if (g_launcherGroupsSyntheticDrag)
+    {
+        // 合成拖动期间整体放行：合成的 LBUTTONDOWN 落在被拖分组按钮上，
+        // 若继续走拦截逻辑会再次进入 EP 拖动状态造成递归；
+        // 且此时任务栏必须正常收到这批输入才能执行它自己的拖动排序。
+        return CallNextHookEx(Shell_TrayWndMouseHook, nCode, wParam, lParam);
+    }
     if (nCode == HC_ACTION)
     {
         POINT pt = ((MOUSEHOOKSTRUCT*)lParam)->pt;

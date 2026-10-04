@@ -930,6 +930,11 @@ DWORD EP_ServiceWindowThread(DWORD unused)
 #define EP_LAUNCHER_GROUP_RELOAD_MSG (WM_APP + 0x513)
 #define EP_LAUNCHER_GROUP_SHOW_APPS_MSG (WM_APP + 0x514)
 #define EP_LAUNCHER_GROUP_VIEWMODE_MSG (WM_APP + 0x515)
+// 换位后按注册表顺序销毁并重建全部分组窗口：
+// 任务栏按钮是分组窗口（自建顶层窗口 + AppUserModelID）的任务项投影，
+// 按钮排列跟随窗口出现顺序，改注册表或合成拖动都不会让任务栏重排；
+// 只有让窗口按新顺序重新出现，按钮顺序才会变。
+#define EP_LAUNCHER_GROUP_REBUILD_MSG (WM_APP + 0x516)
 #define EP_LAUNCHER_GROUP_LISTVIEW_ID 1000
 #define EP_LAUNCHER_GROUP_MENU_RENAME 2101
 #define EP_LAUNCHER_GROUP_MENU_ADD_FOREGROUND 2102
@@ -2098,133 +2103,95 @@ void LauncherGroups_HideDragIndicator()
     }
 }
 
-// ─────────────── 合成系统拖动：让任务栏真正重排按钮 ───────────────
-// 根因（16:04 日志定案）：SwapGroupOrder 只改注册表键枚举顺序，12/12 次成功；
-// 但任务栏按钮的屏幕排列由任务栏自己管理，从不因注册表变化而重排
-// → "换位成功"只存在于日志里，屏幕上从未变过，用户看到的就是"无响应"。
-// 任务栏按钮排序唯一可控入口是任务栏自己的拖放交互（Win11 支持拖动运行按钮排序），
-// 因此松手后由 EP 合成一段 按下→平移→抬起 的 SendInput 序列，
-// 把被拖分组的按钮从原位置拖到目标按钮位置，交给任务栏完成重排。
-// 注册表键序仍然同步交换：重启 explorer 后 CreateWindowsForLoadedGroups
-// 按注册表枚举顺序创建分组窗口，任务栏按钮的初始顺序即恢复为持久化顺序。
-typedef struct _LauncherGroupsSyntheticDragParams
-{
-    RECT rcFrom;
-    RECT rcTo;
-} LauncherGroupsSyntheticDragParams;
+// ─────────── 按注册表顺序重建分组窗口：让任务栏按钮真正重排 ───────────
+// 用户澄清 + 代码证实（用户反馈是关键）：任务栏上的分组按钮是 **EP 自建
+// 顶层窗口的任务项投影**（CreateWindowForLoadedGroups 建窗在 -32000,
+// -32000 屏幕外，设置 WS_EX_APPWINDOW + AppUserModelID 后任务栏为其
+// 生成按钮，见 5729 行）。任务栏按钮顺序跟随**窗口出现顺序**。
+// 由此定案三件事：
+//   1. SwapGroupOrder 改注册表键序只影响下次建窗顺序，当前按钮不动；
+//   2. 合成系统拖动（上一提交）已被实测证伪：任务栏对"运行任务按钮"
+//      的合成拖放有动画但不落位（用户 16:20 反馈"有换位动画但无实际变化"）；
+//   3. 唯一正路 = 换位后按新注册表顺序**销毁并重建全部分组窗口**，
+//      让按钮按新出现顺序重新排列。这也正是注册表键序机制的设计本意。
+// 重建必须在分组窗口所属线程（LauncherGroupsThread）执行：
+// DestroyWindow/CreateWindow 都要求创建线程，钩子线程只负责 PostThreadMessage。
 
-static LauncherGroupsSyntheticDragParams g_launcherGroupsSyntheticDragParams;
-// 合成期间钩子必须整体放行：合成的 LBUTTONDOWN 落在分组按钮上，
-// 若仍走拦截逻辑会再次进入 EP 拖动状态，形成递归。volatile 保证跨线程可见。
-volatile BOOL g_launcherGroupsSyntheticDrag = FALSE;
-
-static void LauncherGroups_SyntheticSetCursorPos(LONG x, LONG y, int bAbsolute)
+// 销毁全部分组窗口。WM_DESTROY 已负责清理 ListView 子类、DropTargets、图像列表。
+void LauncherGroups_DestroyAllGroupWindows()
 {
-    INPUT input;
-    ZeroMemory(&input, sizeof(input));
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = bAbsolute
-        ? (MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
-        : MOUSEEVENTF_MOVE;
-    if (bAbsolute)
+    for (LauncherGroup* group = g_launcherGroups; group; group = group->next)
     {
-        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int cx = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int cy = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        input.mi.dx = (LONG)((x - vx) * 65535 / (cx > 1 ? cx - 1 : 1));
-        input.mi.dy = (LONG)((y - vy) * 65535 / (cy > 1 ? cy - 1 : 1));
+        if (group->hWnd && IsWindow(group->hWnd))
+        {
+            DestroyWindow(group->hWnd);
+        }
+        group->hWnd = NULL;
+        group->bAppsVisible = FALSE;
     }
-    SendInput(1, &input, sizeof(INPUT));
+    EPDebugLogWrite(L"launcher-group windows destroyed for rebuild");
 }
 
-static DWORD WINAPI LauncherGroups_SyntheticDragThread(LPVOID lpParam)
+// 把 g_launcherGroups 链表按注册表当前枚举顺序重新链接。
+// CreateWindowsForLoadedGroups 按链表顺序建窗 → 链表序 = 按钮序。
+void LauncherGroups_ReorderGroupsToRegistryOrder()
 {
-    POINT from;
-    POINT to;
-    INPUT input;
-    int steps = 14;
-    int i;
+    HKEY hRoot = NULL;
+    LauncherGroup* newHead = NULL;
+    LauncherGroup* newTail = NULL;
+    DWORD index = 0;
 
-    from.x = (g_launcherGroupsSyntheticDragParams.rcFrom.left
-        + g_launcherGroupsSyntheticDragParams.rcFrom.right) / 2;
-    from.y = (g_launcherGroupsSyntheticDragParams.rcFrom.top
-        + g_launcherGroupsSyntheticDragParams.rcFrom.bottom) / 2;
-    to.x = (g_launcherGroupsSyntheticDragParams.rcTo.left
-        + g_launcherGroupsSyntheticDragParams.rcTo.right) / 2;
-    to.y = (g_launcherGroupsSyntheticDragParams.rcTo.top
-        + g_launcherGroupsSyntheticDragParams.rcTo.bottom) / 2;
-
-    // 移到被拖按钮中心 → 按下 → 略停（让任务栏进入拖动态）→ 平移 → 抬起
-    LauncherGroups_SyntheticSetCursorPos(from.x, from.y, TRUE);
-    Sleep(30);
-
-    ZeroMemory(&input, sizeof(input));
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    SendInput(1, &input, sizeof(INPUT));
-    Sleep(60);
-
-    for (i = 1; i <= steps; i++)
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_READ, &hRoot) != ERROR_SUCCESS)
     {
-        LONG x = from.x + (to.x - from.x) * i / steps;
-        LONG y = from.y + (to.y - from.y) * i / steps;
-        LauncherGroups_SyntheticSetCursorPos(x, y, TRUE);
-        Sleep(15);
+        return;
     }
-    Sleep(60);
-
-    ZeroMemory(&input, sizeof(input));
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(1, &input, sizeof(INPUT));
-
-    g_launcherGroupsSyntheticDrag = FALSE;
-    EPDebugLogWrite(L"launcher-group synthetic drag done from=%ld,%ld to=%ld,%ld",
-        from.x, from.y, to.x, to.y);
-    return 0;
-}
-
-// 松手后启动合成拖动（异步：钩子回调绝不能 Sleep）。
-// 返回 FALSE 表示缓存里找不到按钮矩形（理论上不该发生）。
-static BOOL LauncherGroups_StartSyntheticDrag(LauncherGroup* dragged, LauncherGroup* target)
-{
-    int i;
-    BOOL bFrom = FALSE;
-    BOOL bTo = FALSE;
-
-    for (i = 0; i < g_launcherGroupsTaskbarButtonRectCount; i++)
+    while (TRUE)
     {
-        if (!bFrom && LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName) == dragged)
-        {
-            g_launcherGroupsSyntheticDragParams.rcFrom = g_launcherGroupsTaskbarButtonRects[i].rc;
-            bFrom = TRUE;
-        }
-        if (!bTo && LauncherGroups_FindByName(g_launcherGroupsTaskbarButtonRects[i].szName) == target)
-        {
-            g_launcherGroupsSyntheticDragParams.rcTo = g_launcherGroupsTaskbarButtonRects[i].rc;
-            bTo = TRUE;
-        }
-        if (bFrom && bTo)
+        WCHAR szSubKey[128];
+        DWORD cchSubKey = ARRAYSIZE(szSubKey);
+        LauncherGroup** pp = &g_launcherGroups;
+
+        if (RegEnumKeyExW(hRoot, index++, szSubKey, &cchSubKey, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
         {
             break;
         }
+        while (*pp && wcscmp((*pp)->szKeyName, szSubKey) != 0)
+        {
+            pp = &(*pp)->next;
+        }
+        if (*pp)
+        {
+            LauncherGroup* node = *pp;
+            *pp = node->next;
+            node->next = NULL;
+            if (newTail)
+            {
+                newTail->next = node;
+            }
+            else
+            {
+                newHead = node;
+            }
+            newTail = node;
+        }
     }
-    if (!bFrom || !bTo
-        || (g_launcherGroupsSyntheticDragParams.rcFrom.left == g_launcherGroupsSyntheticDragParams.rcTo.left
-            && g_launcherGroupsSyntheticDragParams.rcFrom.top == g_launcherGroupsSyntheticDragParams.rcTo.top))
-    {
-        return FALSE;
-    }
+    RegCloseKey(hRoot);
 
-    g_launcherGroupsSyntheticDrag = TRUE;
-    EPDebugLogWrite(L"launcher-group synthetic drag start");
-    if (!CreateThread(NULL, 0, LauncherGroups_SyntheticDragThread, NULL, 0, NULL))
+    // 注册表里已不存在的残留分组（理论上没有）保留在尾部，防止丢窗口。
+    if (g_launcherGroups)
     {
-        g_launcherGroupsSyntheticDrag = FALSE;
-        return FALSE;
+        if (newTail)
+        {
+            newTail->next = g_launcherGroups;
+        }
+        else
+        {
+            newHead = g_launcherGroups;
+        }
+        g_launcherGroups = NULL;
     }
-    return TRUE;
+    g_launcherGroups = newHead;
+    EPDebugLogWrite(L"launcher-group chain reordered to registry order");
 }
 
 BOOL LauncherGroups_ShouldKeepAppsWindowOpen(LauncherGroup* group)
@@ -2431,10 +2398,13 @@ BOOL LauncherGroups_FinishTaskbarDrag()
         if (dragged && target && dragged != target)
         {
             LauncherGroups_SwapGroupOrder(dragged, target);
-            // 注册表顺序只决定重启后的初始排列；屏幕上的按钮排列由任务栏管理，
-            // 必须合成一次系统拖动让任务栏自己重排，否则用户看到的仍是原顺序
-            // （16:04 日志：12/12 次 swap 成功，屏幕纹丝不动）。
-            LauncherGroups_StartSyntheticDrag(dragged, target);
+            // 按新注册表顺序销毁并重建全部分组窗口：任务栏按钮是分组窗口的
+            // 任务项投影，顺序跟随窗口出现顺序，只有重建才能让按钮重排。
+            // 必须发给分组线程执行（DestroyWindow/CreateWindow 要求创建线程）。
+            if (g_launcherGroupsThreadId)
+            {
+                PostThreadMessageW(g_launcherGroupsThreadId, EP_LAUNCHER_GROUP_REBUILD_MSG, 0, 0);
+            }
         }
         return TRUE;
     }
@@ -5802,6 +5772,16 @@ DWORD LauncherGroupsThread(DWORD unused)
             LauncherGroups_CreateWindowsForLoadedGroups();
             continue;
         }
+        if (msg.message == EP_LAUNCHER_GROUP_REBUILD_MSG)
+        {
+            // 换位后的重排：销毁全部分组窗口 → 链表按注册表顺序重链 → 重建。
+            // 重建顺序 = 窗口出现顺序 = 任务栏按钮顺序（按钮是分组窗口的任务项投影）。
+            EPDebugLogWrite(L"launcher-groups rebuild for order");
+            LauncherGroups_DestroyAllGroupWindows();
+            LauncherGroups_ReorderGroupsToRegistryOrder();
+            LauncherGroups_CreateWindowsForLoadedGroups();
+            continue;
+        }
         if (msg.message == EP_LAUNCHER_GROUP_VIEWMODE_MSG)
         {
             EPDebugLogWrite(L"launcher-groups view mode=%lu", g_launcherGroupsViewMode);
@@ -7708,13 +7688,6 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
     _In_ LPARAM lParam
 )
 {
-    if (g_launcherGroupsSyntheticDrag)
-    {
-        // 合成拖动期间整体放行：合成的 LBUTTONDOWN 落在被拖分组按钮上，
-        // 若继续走拦截逻辑会再次进入 EP 拖动状态造成递归；
-        // 且此时任务栏必须正常收到这批输入才能执行它自己的拖动排序。
-        return CallNextHookEx(Shell_TrayWndMouseHook, nCode, wParam, lParam);
-    }
     if (nCode == HC_ACTION)
     {
         POINT pt = ((MOUSEHOOKSTRUCT*)lParam)->pt;

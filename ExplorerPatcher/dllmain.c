@@ -3491,7 +3491,8 @@ BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR ne
         return FALSE;
     }
 
-    // 复制所有值
+    // 复制所有值。分组子键内的值最长为 1024 WCHAR（2048 字节），
+    // 超过缓冲区上限则中止，避免静默截断导致数据损坏。
     while (TRUE)
     {
         WCHAR valueName[256];
@@ -3503,6 +3504,13 @@ BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR ne
         if (RegEnumValueW(hOld, index++, valueName, &cchName, NULL, &type, data, &cbData) != ERROR_SUCCESS)
         {
             break;
+        }
+
+        if (cbData > sizeof(data))
+        {
+            RegCloseKey(hNew);
+            RegCloseKey(hOld);
+            return FALSE;
         }
 
         if (cchName == 0)
@@ -3542,6 +3550,14 @@ BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR ne
                     {
                         break;
                     }
+                    if (cbData > sizeof(data))
+                    {
+                        RegCloseKey(hDst);
+                        RegCloseKey(hSrc);
+                        RegCloseKey(hNew);
+                        RegCloseKey(hOld);
+                        return FALSE;
+                    }
                     if (cchName == 0)
                     {
                         valueName[0] = L'\0';
@@ -3555,7 +3571,14 @@ BOOL LauncherGroups_RenameRegistrySubKey(HKEY hRoot, LPCWSTR oldName, LPCWSTR ne
     }
 
     RegCloseKey(hNew);
-    RegDeleteKeyExW(hRoot, oldName, 0, 0);
+    // 必须确认源键已删除，否则下一步改目标名会因"目标已存在"而失败，
+    // 造成键名重复、分组显示错乱。
+    if (RegDeleteKeyExW(hRoot, oldName, 0, 0) != ERROR_SUCCESS)
+    {
+        RegDeleteKeyExW(hRoot, newName, 0, 0);
+        RegCloseKey(hOld);
+        return FALSE;
+    }
     RegCloseKey(hOld);
     ok = TRUE;
     return ok;
@@ -3575,6 +3598,7 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
     int i;
     WCHAR(*keys)[128] = NULL;
     WCHAR(*temps)[128] = NULL;
+    WCHAR(*ordered)[128] = NULL;
     BOOL ok = FALSE;
 
     if (!pDragged || !pTarget || pDragged == pTarget || !pDragged->szKeyName[0] || !pTarget->szKeyName[0])
@@ -3603,10 +3627,12 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
 
     keys = (WCHAR(*)[128])calloc(total, sizeof(WCHAR) * 128);
     temps = (WCHAR(*)[128])calloc(total, sizeof(WCHAR) * 128);
-    if (!keys || !temps)
+    ordered = (WCHAR(*)[128])calloc(total, sizeof(WCHAR) * 128);
+    if (!keys || !temps || !ordered)
     {
         free(keys);
         free(temps);
+        free(ordered);
         return FALSE;
     }
 
@@ -3617,10 +3643,11 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
         LauncherGroups_CopyString(keys[idx], 128, g->szKeyName);
     }
 
-    // 构造目标顺序：取出被拖动组，插入到目标组位置
+    // 构造目标顺序：取出被拖动组，插入到目标组所在位置。
+    // 必须写入独立的 ordered 缓冲区——若原地压缩，write 追上 read 后
+    // 会用已改写的内容覆盖尚未读取的源数据，导致键名错乱。
     {
         WCHAR dragged[128];
-        int insertAt = indexDrag < indexTarget ? indexTarget : indexTarget;
         int write = 0;
         int read;
 
@@ -3632,29 +3659,42 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
             {
                 continue;
             }
-            if (write == insertAt)
+            if (write == indexTarget)
             {
-                LauncherGroups_CopyString(keys[write], 128, dragged);
+                LauncherGroups_CopyString(ordered[write], 128, dragged);
                 write++;
             }
-            LauncherGroups_CopyString(keys[write], 128, keys[read]);
+            LauncherGroups_CopyString(ordered[write], 128, keys[read]);
             write++;
         }
-        if (write == insertAt)
+        if (write < total)
         {
-            LauncherGroups_CopyString(keys[write], 128, dragged);
+            LauncherGroups_CopyString(ordered[write], 128, dragged);
+            write++;
         }
+
+        if (write != total)
+        {
+            free(keys);
+            free(temps);
+            free(ordered);
+            return FALSE;
+        }
+
+        // 回写为最终顺序
+        memcpy(keys, ordered, total * sizeof(WCHAR) * 128);
     }
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER, EP_LAUNCHER_GROUPS_REGPATH, 0, KEY_WRITE | KEY_READ, &hKey) != ERROR_SUCCESS)
     {
         free(keys);
         free(temps);
+        free(ordered);
         return FALSE;
     }
 
-    // 第一步：全部改到临时名，避免互相覆盖
-    // 临时名加"~EP_TMP_"前缀，枚举时排到原有键之后，避免中途影响显示名称读取
+    // 第一步：全部改到临时名，避免互相覆盖。
+    // 临时名用纯数字后缀（"~EP_TMP_0"），不含高位字符，枚举时排在 "Group..." 之后。
     for (i = 0; i < total; i++)
     {
         swprintf_s(temps[i], 128, L"~EP_TMP_%d", i);
@@ -3663,18 +3703,27 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
             RegCloseKey(hKey);
             free(keys);
             free(temps);
+            free(ordered);
             return FALSE;
         }
     }
 
-    // 第二步：临时名改为目标顺序下的键名
+    // 第二步：临时名改为目标顺序下的键名。
+    // 若中途失败，把已改名的键改回临时名，让注册表停留在"全部为临时名"的一致状态，
+    // 而不是一半新名一半临时名的半改状态——否则分组键名会与显示名错配。
     for (i = 0; i < total; i++)
     {
         if (!LauncherGroups_RenameRegistrySubKey(hKey, temps[i], keys[i]))
         {
+            for (int j = i - 1; j >= 0; j--)
+            {
+                LauncherGroups_RenameRegistrySubKey(hKey, keys[j], temps[j]);
+            }
             RegCloseKey(hKey);
             free(keys);
             free(temps);
+            free(ordered);
+            EPDebugLogWrite(L"launcher-group swap order FAILED at %d, rolled back", i);
             return FALSE;
         }
     }
@@ -3683,6 +3732,7 @@ BOOL LauncherGroups_SwapGroupOrder(LauncherGroup* pDragged, LauncherGroup* pTarg
     RegCloseKey(hKey);
     free(keys);
     free(temps);
+    free(ordered);
 
     if (ok)
     {

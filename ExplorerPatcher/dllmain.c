@@ -1560,6 +1560,10 @@ BOOL LauncherGroups_MoveItem(LauncherGroup* group, int from, int to)
 
     if (!group || from < 0 || to < 0 || from >= (int)group->cItems || to >= (int)group->cItems || from == to)
     {
+        // 这个分支过去是"静默失败"，导致 from 被上游清成 -1 时完全看不出异常。
+        EPDebugLogWrite(
+            L"launcher-group move item REJECTED group=\"%s\" from=%d to=%d count=%lu",
+            group ? group->szName : L"(null)", from, to, group ? group->cItems : 0);
         return FALSE;
     }
 
@@ -1584,6 +1588,8 @@ BOOL LauncherGroups_MoveItem(LauncherGroup* group, int from, int to)
         EPDebugLogWrite(L"launcher-group move item group=\"%s\" from=%d to=%d", group->szName, from, to);
         return TRUE;
     }
+    EPDebugLogWrite(
+        L"launcher-group move item SAVE FAILED group=\"%s\" from=%d to=%d", group->szName, from, to);
     return FALSE;
 }
 
@@ -4883,21 +4889,31 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
         {
             POINT pt;
             int target;
+            int fromIndex;
             pt.x = GET_X_LPARAM(lParam);
             pt.y = GET_Y_LPARAM(lParam);
             ClientToScreen(hWnd, &pt);
             target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            fromIndex = group->iDragItem;
             EPDebugLogWrite(
                 L"launcher-group item drag up hwnd=%p from=%d target=%d capture=%p",
-                hWnd, group->iDragItem, target, GetCapture());
-            ReleaseCapture();
+                hWnd, fromIndex, target, GetCapture());
+
+            // 顺序至关重要：必须先完成换位，再清状态、最后 ReleaseCapture。
+            // ReleaseCapture 会**同步**把 WM_CAPTURECHANGED 发给本窗口
+            // （官方文档明确：窗口自己调用 ReleaseCapture 也会收到该消息），
+            // 而下面的 WM_CAPTURECHANGED 分支会把 iDragItem 清成 -1。
+            // 旧代码先 ReleaseCapture 再读 group->iDragItem，
+            // 于是 MoveItem 拿到 from=-1，在入口校验处直接 return FALSE
+            // → 表现为"拖动有高亮、松手没反应"，日志里 move item 恒为 0 次。
             group->bDragActive = FALSE;
-            if (target >= 0 && target < (int)group->cItems && target != group->iDragItem)
-            {
-                LauncherGroups_MoveItem(group, group->iDragItem, target);
-            }
             group->iDragItem = -1;
             group->iLastDropTarget = -1;
+            if (target >= 0 && target < (int)group->cItems && target != fromIndex)
+            {
+                LauncherGroups_MoveItem(group, fromIndex, target);
+            }
+            ReleaseCapture();
             return 0;
         }
         if (uMsg == WM_CAPTURECHANGED && group->bDragActive)

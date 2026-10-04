@@ -1016,6 +1016,7 @@ typedef struct _LauncherGroup
     BOOL bSuppressNextClick;
     DWORD dwSuppressClickUntil;
     int iDragItem;
+    int iLastDropTarget;
     IDropTarget* pDropTarget;
     IDropTarget* pListDropTarget;
     DWORD dwMenuMode;
@@ -2000,6 +2001,7 @@ BOOL LauncherGroups_LoadFromRegistry()
             continue;
         }
         group->iDragItem = -1;
+        group->iLastDropTarget = -1;
 
         LauncherGroups_CopyString(group->szKeyName, ARRAYSIZE(group->szKeyName), szSubKey);
         LauncherGroups_CopyString(group->szName, ARRAYSIZE(group->szName), szSubKey);
@@ -2626,21 +2628,24 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidt
     // ListView 图标模式每项占位 = max(图标宽, 标签实测宽) + 图标间距，
     // 单元格宽度必须不小于该值，否则每行放不下设定列数。
     // labelWidth 统一取全局最宽标签（各分组一致），spacing 为用户自定义的项目间隔百分比。
-    cellCx = baseCx;
-    if (labelWidth > 0)
+    // 项目间隔（关键修正）：ListView 图标视图会把单元格宽度**下限锁死在标签实测宽度上**。
+    // 旧实现按"整体宽度百分比"缩放（gapExtra = MulDiv(cellCx - iconSize, spacing-100, 100)），
+    // 一旦目标宽度低于标签下限，多出来的差值就被下限吃掉 —— 表现为调小间隔时蓝色高亮框
+    // 纹丝不动（实测恒为 140px =最宽标签 117px + 内边距，与 spacing 取值无关）。
+    // 改为「内容宽 + 可缩放留白」：cellCx 恒 >= 标签下限，故调大/调小都会被 ListView 采纳。
     {
-        int labelBased = labelWidth + MulDiv(8, iconSize, baseCx);
-        cellCx = max(cellCx, labelBased);
-    }
-    if (g_launcherGroupsItemSpacing != EP_LAUNCHER_GROUP_SPACING_DEFAULT)
-    {
-        int gapExtra = MulDiv(cellCx - iconSize, (int)g_launcherGroupsItemSpacing - 100, 100);
-        cellCx = cellCx + gapExtra;
-        if (cellCx < iconSize + MulDiv(24, iconSize, 48))
+        int contentCx = iconSize;
+        int baseGap;
+
+        if (labelWidth > 0)
         {
-            cellCx = iconSize + MulDiv(24, iconSize, 48);
+            contentCx = max(contentCx, labelWidth + MulDiv(8, iconSize, baseCx));
         }
-        cellCy += gapExtra;
+        baseGap = max(1, baseCx - iconSize);
+        // 横向：留白随间隔线性缩放，且始终叠加在内容宽之上，故两个方向均可见。
+        cellCx = contentCx + MulDiv(baseGap, (int)g_launcherGroupsItemSpacing, 100);
+        // 纵向沿用比例缩放（纵向本就不受标签宽度下限影响）。
+        cellCy += MulDiv(baseGap, (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_DEFAULT, 100);
     }
 
     columns = max(1, columns);
@@ -2819,7 +2824,11 @@ void LauncherGroups_ApplyAppsFont(LauncherGroup* group)
     }
 }
 
-BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
+BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group);
+// 前置声明：ListView 子类在下方定义，但 EnsureAppsListView 里就要挂上去。
+static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
+    _In_ HWND hWnd, _In_ UINT uMsg, _In_ WPARAM wParam, _In_ LPARAM lParam,
+    _In_ UINT_PTR uIdSubclass, _In_ DWORD_PTR dwRefData);
 {
     if (!group || !hWnd)
     {
@@ -2852,6 +2861,8 @@ BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
     LauncherGroups_ApplyAppsFont(group);
     ListView_SetExtendedListViewStyle(group->hListView, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP);
     DragAcceptFiles(group->hListView, TRUE);
+    SetWindowSubclass(group->hListView, LauncherGroups_ListViewSubclassProc,
+        EP_LAUNCHER_GROUP_LISTVIEW_ID, (DWORD_PTR)group);
     LauncherGroups_RegisterDropTargets(group);
     return TRUE;
 }
@@ -4726,6 +4737,69 @@ int LauncherGroups_HitTestListViewItemAtPoint(LauncherGroup* group, POINT ptScre
     return -1;
 }
 
+// ListView 子类：拖动期间鼠标捕获在 ListView 上（见 LVN_BEGINDRAG），
+// 因此 WM_MOUSEMOVE / WM_LBUTTONUP 必须在这里处理，父窗口收不到。
+// 同时负责绘制"插入位置"高亮，松手时调用 LauncherGroups_MoveItem。
+static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
+    _In_ HWND hWnd,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam,
+    _In_ UINT_PTR uIdSubclass,
+    _In_ DWORD_PTR dwRefData)
+{
+    LauncherGroup* group = (LauncherGroup*)dwRefData;
+
+    if (group && group->hListView == hWnd)
+    {
+        if (uMsg == WM_MOUSEMOVE && group->bDragActive)
+        {
+            POINT pt;
+            int target;
+            pt.x = GET_X_LPARAM(lParam);
+            pt.y = GET_Y_LPARAM(lParam);
+            ClientToScreen(hWnd, &pt);
+            target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            if (target >= 0 && target != group->iLastDropTarget)
+            {
+                group->iLastDropTarget = target;
+                // 高亮目标项，让用户看到会落到哪
+                ListView_SetItemState(hWnd, -1, LVIS_SELECTED | LVIS_FOCUSED, 0);
+                ListView_SetItemState(hWnd, target, LVIS_SELECTED | LVIS_FOCUSED,
+                    LVIS_SELECTED | LVIS_FOCUSED);
+            }
+            return 0;
+        }
+        if (uMsg == WM_LBUTTONUP && group->bDragActive)
+        {
+            POINT pt;
+            int target;
+            pt.x = GET_X_LPARAM(lParam);
+            pt.y = GET_Y_LPARAM(lParam);
+            ClientToScreen(hWnd, &pt);
+            target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            ReleaseCapture();
+            group->bDragActive = FALSE;
+            if (target >= 0 && target < (int)group->cItems && target != group->iDragItem)
+            {
+                LauncherGroups_MoveItem(group, group->iDragItem, target);
+            }
+            group->iDragItem = -1;
+            group->iLastDropTarget = -1;
+            return 0;
+        }
+        if (uMsg == WM_CAPTURECHANGED && group->bDragActive)
+        {
+            // 捕获被系统或ListView 抢走：结束拖动，避免状态卡在TRUE
+            group->bDragActive = FALSE;
+            group->iDragItem = -1;
+            group->iLastDropTarget = -1;
+        }
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
 LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     LauncherGroup* group = (LauncherGroup*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
@@ -4896,10 +4970,15 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                 group->dwSuppressClickUntil = GetTickCount() + 500;
                 if (group->bDragActive)
                 {
-                    SetCapture(hWnd);
+                    // 必须捕获到 ListView 本身：按下发生在子窗口上，若捕获父窗口，
+                    // ListView 仍会在拖动开始时抢回捕获并截走后续鼠标消息。
+                    SetCapture(group->hListView ? group->hListView : hWnd);
                     EPDebugLogWrite(L"launcher-group drag begin group=\"%s\" index=%d", group->szName, group->iDragItem);
                 }
-                return 0;
+                // 必须返回非 0 抑制 ListView 自带的拖动：否则 ListView 会继续走它自己的
+                // 拖动流程并重新捕获鼠标，本窗口的 WM_LBUTTONUP 永远不会到达，
+                // WM_MOUSEMOVE/WM_LBUTTONUP 里的换位逻辑成了死代码。
+                return group->bDragActive ? 1 : 0;
             }
             if (hdr->code == LVN_KEYDOWN)
             {
@@ -4915,46 +4994,6 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                     return 0;
                 }
             }
-        }
-        break;
-    case WM_MOUSEMOVE:
-        if (group && group->bDragActive)
-        {
-            POINT pt;
-            pt.x = GET_X_LPARAM(lParam);
-            pt.y = GET_Y_LPARAM(lParam);
-            ClientToScreen(hWnd, &pt);
-            int target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
-            if (target >= 0 && target < (int)group->cItems)
-            {
-                ListView_SetItemState(group->hListView, target, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-            }
-            return 0;
-        }
-        break;
-    case WM_LBUTTONUP:
-        if (group && group->bDragActive)
-        {
-            POINT pt;
-            pt.x = GET_X_LPARAM(lParam);
-            pt.y = GET_Y_LPARAM(lParam);
-            ClientToScreen(hWnd, &pt);
-            int target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
-            ReleaseCapture();
-            group->bDragActive = FALSE;
-            if (target >= 0 && target < (int)group->cItems)
-            {
-                LauncherGroups_MoveItem(group, group->iDragItem, target);
-            }
-            group->iDragItem = -1;
-            return 0;
-        }
-        break;
-    case WM_CAPTURECHANGED:
-        if (group)
-        {
-            group->bDragActive = FALSE;
-            group->iDragItem = -1;
         }
         break;
     case WM_DROPFILES:
@@ -4974,6 +5013,8 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
             if (group->hListView && IsWindow(group->hListView))
             {
                 DragAcceptFiles(group->hListView, FALSE);
+                RemoveWindowSubclass(group->hListView, LauncherGroups_ListViewSubclassProc,
+                    EP_LAUNCHER_GROUP_LISTVIEW_ID);
             }
             LauncherGroups_DestroyAppsImageLists(group);
             group->hListView = NULL;
@@ -7004,23 +7045,28 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
     if (nCode == HC_ACTION)
     {
         POINT pt = ((MOUSEHOOKSTRUCT*)lParam)->pt;
-        if (wParam == WM_MOUSEMOVE || wParam == WM_NCMOUSEMOVE || wParam == WM_MOUSEHOVER || wParam == WM_NCMOUSEHOVER)
+        // WH_MOUSE_LL 是全局钩子，整个系统每次鼠标事件都会进来。
+        // 拖动中必须无条件处理（鼠标可能已移出任务栏），其余情况先做廉价的任务栏点判断。
+        if (g_launcherGroupsDragActive || LauncherGroups_IsTaskbarPoint(pt))
         {
-            if (LauncherGroups_OnTaskbarMouseMove(pt))
+            if (wParam == WM_MOUSEMOVE || wParam == WM_NCMOUSEMOVE || wParam == WM_MOUSEHOVER || wParam == WM_NCMOUSEHOVER)
             {
-                return 1;
+                if (LauncherGroups_OnTaskbarMouseMove(pt))
+                {
+                    return 1;
+                }
             }
-        }
-        else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
-        {
-            if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
+            else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
             {
-                LauncherGroups_FinishTaskbarDrag();
-                return 1;
-            }
-            if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
-            {
-                return 1;
+                if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
+                {
+                    LauncherGroups_FinishTaskbarDrag();
+                    return 1;
+                }
+                if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
+                {
+                    return 1;
+                }
             }
         }
     }
@@ -12451,7 +12497,11 @@ HWND CreateWindowExWHook(
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"Shell_TrayWnd"))
     {
         SetWindowSubclass(hWnd, Shell_TrayWndSubclassProc, Shell_TrayWndSubclassProc, TRUE);
-        Shell_TrayWndMouseHook = SetWindowsHookExW(WH_MOUSE, Shell_TrayWndMouseProc, NULL, GetCurrentThreadId());
+        //必须用 WH_MOUSE_LL（全局低级鼠标钩子）。
+        // 原先的 WH_MOUSE + GetCurrentThreadId() 只对本线程窗口的消息可见，
+        // 一旦鼠标被捕获到别的窗口/线程（XAML 任务栏按钮、拖动过程），钩子就收不到
+        // WM_MOUSEMOVE/WM_LBUTTONUP —— 表现为"按下有效、拖动无反应、松手像点了一下菜单"。
+        Shell_TrayWndMouseHook = SetWindowsHookExW(WH_MOUSE_LL, Shell_TrayWndMouseProc, NULL, 0);
     }
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"Shell_SecondaryTrayWnd"))
     {

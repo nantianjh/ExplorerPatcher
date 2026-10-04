@@ -1051,10 +1051,10 @@ DWORD g_launcherGroupsItemSpacing = 100;
 BOOL g_launcherGroupsDragActive = FALSE;
 LauncherGroup* g_launcherGroupsDragGroup = NULL;
 LauncherGroup* g_launcherGroupsDragDropTarget = NULL;
-LauncherGroup* g_launcherGroupsPendingMenuGroup = NULL;
 POINT g_launcherGroupsDragStartPt = { 0, 0 };
 HWND g_launcherGroupsTaskbarWnd = NULL;
 DWORD g_launcherGroupsLastDragCheckTick = 0;
+BOOL g_launcherGroupsDragMoved = FALSE;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -1863,13 +1863,18 @@ BOOL LauncherGroups_OnTaskbarMouseMove(POINT pt)
         //否则高频 WM_MOUSEMOVE 会把任务栏线程拖垮，鼠标明显发卡。
         LONG dx = pt.x - g_launcherGroupsDragStartPt.x;
         LONG dy = pt.y - g_launcherGroupsDragStartPt.y;
-        if (dx * dx + dy * dy > 16
-            && tick - g_launcherGroupsLastDragCheckTick >= 40)
+        if (dx * dx + dy * dy > 16)
         {
-            LauncherGroup* target;
-            g_launcherGroupsLastDragCheckTick = tick;
-            target = LauncherGroups_FindGroupAtPoint(pt);
-            g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
+            // 标记"确实动过"：释放时据此与单击区分，
+            // 避免手抖数像素被误判成单击而打开分组窗口。
+            g_launcherGroupsDragMoved = TRUE;
+            if (tick - g_launcherGroupsLastDragCheckTick >= 40)
+            {
+                LauncherGroup* target;
+                g_launcherGroupsLastDragCheckTick = tick;
+                target = LauncherGroups_FindGroupAtPoint(pt);
+                g_launcherGroupsDragDropTarget = (target && target != g_launcherGroupsDragGroup) ? target : NULL;
+            }
         }
         return TRUE;
     }
@@ -1933,6 +1938,8 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
         g_launcherGroupsDragDropTarget = NULL;
         g_launcherGroupsDragStartPt = pt;
         g_launcherGroupsDragActive = TRUE;
+        // 必须在按下时清零：这是上次拖动的残留值，不清会把本次单击误判为拖动。
+        g_launcherGroupsDragMoved = FALSE;
         // 捕获到任务栏**根窗口**（Shell_TrayWnd），而不是 WindowFromPoint 的直接结果。
         // 直接结果在 XAML 任务栏上往往是跨线程的子窗口，捕获过去后本线程钩子
         // 收不到 WM_MOUSEMOVE/WM_LBUTTONUP，拖动就"无响应"。
@@ -1943,9 +1950,10 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
             g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
         }
         SetCapture(g_launcherGroupsTaskbarWnd);
-        // 暂不弹菜单：若立即弹出，用户刚开始拖动就会被菜单打断。
-        // 改为在"释放时未发生拖动"的情况下补弹菜单。
-        g_launcherGroupsPendingMenuGroup = group;
+        // 左键从此专职拖动：不再记录"待弹菜单"。
+        // 菜单统一挪到右键（见钩子的 WM_RBUTTONUP 分支），
+        // 原先"释放时位移<4px 补弹菜单"的逻辑会让左键语义歧义——
+        // 手抖超过 4px 菜单不弹、拖动又未必命中目标，两头落空表现为"无反应"。
     }
     return TRUE;
 }
@@ -1954,8 +1962,8 @@ BOOL LauncherGroups_FinishTaskbarDrag()
 {
     LauncherGroup* dragged = g_launcherGroupsDragGroup;
     LauncherGroup* target = g_launcherGroupsDragDropTarget;
-    LauncherGroup* pendingMenu = g_launcherGroupsPendingMenuGroup;
     POINT startPt = g_launcherGroupsDragStartPt;
+    BOOL bMoved = g_launcherGroupsDragMoved;
     POINT releasePt;
     LONG dx;
     LONG dy;
@@ -1967,15 +1975,17 @@ BOOL LauncherGroups_FinishTaskbarDrag()
     g_launcherGroupsDragActive = FALSE;
     g_launcherGroupsDragGroup = NULL;
     g_launcherGroupsDragDropTarget = NULL;
-    g_launcherGroupsPendingMenuGroup = NULL;
+    g_launcherGroupsDragMoved = FALSE;
     if (g_launcherGroupsTaskbarWnd)
     {
         ReleaseCapture();
     }
 
-    if (dx * dx + dy * dy > 16)
+    if (bMoved)
     {
-        // 确实发生了拖动
+        // 确实发生了拖动：有目标则交换，没有就什么都不做。
+        // 绝不在拖动结束后补弹任何窗口/菜单 —— 那正是原先
+        // "拖不动、松手像误触菜单"观感的来源。
         if (dragged && target && dragged != target)
         {
             LauncherGroups_SwapGroupOrder(dragged, target);
@@ -1983,10 +1993,11 @@ BOOL LauncherGroups_FinishTaskbarDrag()
         return TRUE;
     }
 
-    // 未拖动（等同普通左键点击）→ 补弹分组菜单
-    if (pendingMenu && pendingMenu->hWnd && IsWindow(pendingMenu->hWnd))
+    // 未移动（普通左键单击）→ 打开/置前该分组的窗口。
+    // 菜单已统一挪到右键，左键不再有第二种含义。
+    if (dragged && dragged->hWnd && IsWindow(dragged->hWnd))
     {
-        PostMessageW(pendingMenu->hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+        PostMessageW(dragged->hWnd, EP_LAUNCHER_GROUP_SHOW_APPS_MSG, 0, 0);
     }
     return TRUE;
 }
@@ -2663,23 +2674,22 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidt
 
     // ListView 图标模式每项占位 = max(图标宽, 标签实测宽) + 图标间距，
     // 单元格宽度必须不小于该值，否则每行放不下设定列数。
-    // labelWidth 统一取全局最宽标签（各分组一致），spacing 为用户自定义的项目间隔百分比。
+    // spacing 为用户自定义的项目间隔百分比。
     // 项目间隔：横向留白直接由间隔百分比决定，且始终叠加在内容宽之上。
-    // （关键约束）ListView 图标视图会把单元格宽度**下限锁死在标签实测宽度上**，
-    // 任何低于该下限的 LVM_SETICONSPACING 请求都会被无声忽略 —— 这正是上一轮
-    // "按整体宽度百分比缩放"调小时完全无响应的根因。
-    // 新映射：MIN(50%) 时留白为 0（单元格=内容宽，最紧），100% 时为半个图标宽，
-    // 300% 时为 2.5 个图标宽。跨度 ~2.5 倍图标宽，肉眼可辨；
-    // 且在 80%（用户当前设置）处恰好还原此前的视觉宽度，不突兀。
+    // （实测证伪了此前"ListView 有宽度下限"的猜测）日志显示
+    // req=260x108 / measuredCell=260x93 / pitch=260 —— ListView 忠实采纳传入值。
+    // 真正的根因是 contentCx 取了「全局最宽标签 + 余量」：
+    // RecalcGlobalCellWidth 遍历所有分组取最宽标签，只要任意分组里有一个长文件名
+    // （如 windsurf-account-manager），所有分组的所有格子都会被撑到 260px，
+    // 用户把间隔调到最小也动不了它 —— "左右间距大"的正是短标签格子里的空白。
+    // 现改为：格子宽度 = 图标宽 + 可控留白，标签超宽时在格子内自动换行
+    // （Explorer 桌面图标即此行为）。附带收益：所有分组 cellCx 恒一致，
+    // 同列数下窗口宽度天然统一，不再依赖标签测量。
+    UNREFERENCED_PARAMETER(labelWidth);
     {
-        int contentCx = iconSize;
         int baseGap;
         int gap;
 
-        if (labelWidth > 0)
-        {
-            contentCx = max(contentCx, labelWidth + MulDiv(8, iconSize, baseCx));
-        }
         baseGap = max(1, baseCx - iconSize);
         gap = MulDiv(iconSize,
             (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_MIN, 100);
@@ -2687,10 +2697,14 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidt
         {
             gap = 0;
         }
-        cellCx = contentCx + gap;
-        // 纵向沿用比例缩放（纵向不受标签宽度下限影响，原行为可用）。
-        cellCy += MulDiv(baseGap,
-            (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_DEFAULT, 100);
+        cellCx = iconSize + gap;
+        // 纵向只在间隔调大时增加，调小不缩：格子变窄后长标签会换行占多行，
+        // 纵向必须保留足够高度，否则多行标签会被裁掉。
+        if (g_launcherGroupsItemSpacing > EP_LAUNCHER_GROUP_SPACING_DEFAULT)
+        {
+            cellCy += MulDiv(baseGap,
+                (int)g_launcherGroupsItemSpacing - EP_LAUNCHER_GROUP_SPACING_DEFAULT, 100);
+        }
     }
 
     columns = max(1, columns);
@@ -7122,18 +7136,34 @@ LRESULT CALLBACK Shell_TrayWndMouseProc(
                 return 1;
             }
         }
-        else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
-        {
-            if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
+            else if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)
             {
-                LauncherGroups_FinishTaskbarDrag();
-                return 1;
+                if (wParam == WM_LBUTTONUP && g_launcherGroupsDragActive)
+                {
+                    LauncherGroups_FinishTaskbarDrag();
+                    return 1;
+                }
+                if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
+                {
+                    return 1;
+                }
             }
-            if (LauncherGroups_OnTaskbarLeftButton(pt, wParam == WM_LBUTTONDOWN))
+            else if (wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP)
             {
-                return 1;
+                // 分组按钮上的右键 = 打开该分组的设置菜单（用户要求的交互）。
+                // 必须同时吞掉 DOWN 与 UP：只吞 UP 会让 XAML 按钮卡在按下态，
+                // 且系统还会弹自己的跳转列表。
+                // 注意只拦"点在分组上"的情况，任务栏空白处的右键走原有逻辑。
+                LauncherGroup* group = LauncherGroups_FindGroupAtPoint(pt);
+                if (group && group->hWnd && IsWindow(group->hWnd))
+                {
+                    if (wParam == WM_RBUTTONUP)
+                    {
+                        PostMessageW(group->hWnd, EP_LAUNCHER_GROUP_SHOW_MENU_MSG, 0, 0);
+                    }
+                    return 1;
+                }
             }
-        }
     }
     if (!bOldTaskbar &&
         !bNoPropertiesInContextMenu &&

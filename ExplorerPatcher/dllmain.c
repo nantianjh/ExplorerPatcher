@@ -1044,6 +1044,7 @@ void LauncherGroups_ResizeAppsListView(LauncherGroup* group);
 void LauncherGroups_RegisterDropTargets(LauncherGroup* group);
 void LauncherGroups_RevokeDropTargets(LauncherGroup* group);
 void LauncherGroups_SetAppUserModelId(LauncherGroup* group);
+void LauncherGroups_AlignColumnsToSetting(LauncherGroup* group, int columns, int spacingCx);
 
 BOOL LauncherGroups_EnsureItemCapacity(LauncherGroup* group, DWORD cItemsNeeded)
 {
@@ -2283,7 +2284,58 @@ DWORD LauncherGroups_GetAppsListViewStyle()
     }
 }
 
-BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int* pColumns, int* pRows, int* pCellCx, int* pCellCy, int* pPaddingCx, int* pPaddingCy)
+// 图标视图下ListView 依据"图标宽与标签宽的较大者 + 图标间距"决定每行项目数，
+// 因此必须用真实字体测量标签宽度，否则标签较长（或字体被用户放大）时
+// 每行实际能放下的项目会少于设定列数，出现"设 5 个却只显示 4 个、右侧留白"。
+int LauncherGroups_MeasureAppsLabelWidth(LauncherGroup* group, int iconSize)
+{
+    HFONT hFontOld;
+    HDC hdc;
+    RECT rc;
+    LONG widest = 0;
+    int iCount = 8;
+
+    if (!group)
+    {
+        return 0;
+    }
+
+    hdc = GetDC(group->hListView);
+    if (!hdc)
+    {
+        return 0;
+    }
+
+    hFontOld = (HFONT)SelectObject(hdc, group->hFont ? group->hFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+
+    for (DWORD i = 0; i < group->cItems && iCount > 0; i++)
+    {
+        if (!group->items[i].szName[0])
+        {
+            continue;
+        }
+        SetRect(&rc, 0, 0, 0, 0);
+        DrawTextW(hdc, group->items[i].szName, -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        if (rc.right - rc.left > widest)
+        {
+            widest = rc.right - rc.left;
+        }
+        iCount--;
+    }
+
+    SelectObject(hdc, hFontOld);
+    ReleaseDC(group->hListView, hdc);
+
+    if (widest <= 0)
+    {
+        return 0;
+    }
+
+    // 留一点余量，避免刚好卡在临界值导致换行抖动
+    return (int)widest + MulDiv(4, iconSize, 48);
+}
+
+BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int labelWidth, int* pColumns, int* pRows, int* pCellCx, int* pCellCy, int* pPaddingCx, int* pPaddingCy)
 {
     int iconSize = LauncherGroups_GetAppsIconSize(viewMode);
     int smallBase = max(1, LauncherGroups_GetAppsIconSize(LAUNCHER_GROUP_VIEW_SMALL_ICONS));
@@ -2297,32 +2349,42 @@ BOOL LauncherGroups_GetAppsIconLayout(DWORD viewMode, DWORD count, int* pColumns
     int cellCy;
     int paddingCx;
     int paddingCy;
+    int baseCx;
 
     switch (viewMode)
     {
     case LAUNCHER_GROUP_VIEW_LARGE_ICONS:
         columns = (int)min(itemCount, maxColumns);
-        cellCx = max(iconSize + MulDiv(56, iconSize, largeBase), MulDiv(112, iconSize, largeBase));
+        baseCx = max(iconSize + MulDiv(56, iconSize, largeBase), MulDiv(112, iconSize, largeBase));
         cellCy = max(iconSize + MulDiv(80, iconSize, largeBase), MulDiv(124, iconSize, largeBase));
         paddingCx = MulDiv(24, iconSize, largeBase);
         paddingCy = MulDiv(44, iconSize, largeBase);
         break;
     case LAUNCHER_GROUP_VIEW_MEDIUM_ICONS:
         columns = (int)min(itemCount, maxColumns);
-        cellCx = max(iconSize + MulDiv(46, iconSize, mediumBase), MulDiv(92, iconSize, mediumBase));
+        baseCx = max(iconSize + MulDiv(46, iconSize, mediumBase), MulDiv(92, iconSize, mediumBase));
         cellCy = max(iconSize + MulDiv(60, iconSize, mediumBase), MulDiv(100, iconSize, mediumBase));
         paddingCx = MulDiv(24, iconSize, mediumBase);
         paddingCy = MulDiv(40, iconSize, mediumBase);
         break;
     case LAUNCHER_GROUP_VIEW_SMALL_ICONS:
         columns = (int)min(itemCount, maxColumns);
-        cellCx = max(iconSize + MulDiv(36, iconSize, smallBase), MulDiv(60, iconSize, smallBase));
+        baseCx = max(iconSize + MulDiv(36, iconSize, smallBase), MulDiv(60, iconSize, smallBase));
         cellCy = max(iconSize + MulDiv(40, iconSize, smallBase), MulDiv(66, iconSize, smallBase));
         paddingCx = MulDiv(22, iconSize, smallBase);
         paddingCy = MulDiv(36, iconSize, smallBase);
         break;
     default:
         return FALSE;
+    }
+
+    // ListView 图标模式每项占位 = max(图标宽, 标签实测宽) + 图标间距，
+    // 单元格宽度必须不小于该值，否则每行放不下设定列数。
+    cellCx = baseCx;
+    if (labelWidth > 0)
+    {
+        int labelBased = labelWidth + MulDiv(8, iconSize, baseCx);
+        cellCx = max(cellCx, labelBased);
     }
 
     columns = max(1, columns);
@@ -2553,10 +2615,12 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
     int maxCx;
     int maxCy;
     int availCx;
+    int labelWidth;
 
     size.cx = 300;
     size.cy = 160;
-    if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy))
+    labelWidth = LauncherGroups_MeasureAppsLabelWidth(group, iconSize);
+    if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, labelWidth, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy))
     {
         size.cx = columns * cellCx + paddingCx;
         size.cy = rows * cellCy + paddingCy;
@@ -2588,7 +2652,7 @@ SIZE LauncherGroups_GetAppsWindowSize(LauncherGroup* group)
             //图标视图下ListView 按客户区宽度自动换行，若窗口被工作区宽度截断，
             //实际每行数会少于设定值。这里按可用的客户区宽度回推能放下的列数，
             //并据此重算宽度，避免出现"设了4 个却只显示 3 个、右侧留白"的错位。
-            if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy)
+            if (LauncherGroups_GetAppsIconLayout(g_launcherGroupsViewMode, count, labelWidth, &columns, &rows, &cellCx, &cellCy, &paddingCx, &paddingCy)
                 && cellCx > 0)
             {
                 int frameCx = 0;
@@ -2717,6 +2781,7 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
     if (LauncherGroups_GetAppsIconLayout(
         g_launcherGroupsViewMode,
         group->cItems ? group->cItems : 1,
+        LauncherGroups_MeasureAppsLabelWidth(group, LauncherGroups_GetAppsIconSize(g_launcherGroupsViewMode)),
         &columns,
         &rows,
         &spacingCx,
@@ -2729,7 +2794,91 @@ void LauncherGroups_UpdateAppsWindow(LauncherGroup* group)
 
     LauncherGroups_ResizeAppsListView(group);
     LauncherGroups_UpdateWindowSize(group);
+    LauncherGroups_AlignColumnsToSetting(group, columns, spacingCx);
     InvalidateRect(group->hListView, NULL, TRUE);
+}
+
+// 闭环校正：ListView 在图标视图下自行决定换行位置，其实际每行项目数由客户区宽度、
+// 图标间距与标签实测宽度共同决定，纯靠公式推算无法完全对齐（还会随字体、DPI、
+// 用户自定义文字缩放而变化）。这里在填充项目后实测"第 columns 项是否换行"，
+// 若换行则按实际间距反推所需宽度并重排，直到一致或达到迭代上限。
+void LauncherGroups_AlignColumnsToSetting(LauncherGroup* group, int columns, int spacingCx)
+{
+    if (!group || !group->hListView || !IsWindow(group->hListView) || columns <= 0)
+    {
+        return;
+    }
+    if (g_launcherGroupsViewMode == LAUNCHER_GROUP_VIEW_LIST)
+    {
+        return;
+    }
+    if (group->cItems <= (DWORD)columns)
+    {
+        // 项目数不超过设定列数，必然一行排满
+        return;
+    }
+    if (spacingCx <= 0)
+    {
+        return;
+    }
+
+    for (int attempt = 0; attempt < 4; attempt++)
+    {
+        RECT rcItem;
+        RECT rcFirst;
+        RECT rcSecond;
+        int actualColumns;
+        int needCx;
+
+        if (!ListView_GetItemRect(group->hListView, columns, &rcItem, LVIR_BOUNDS))
+        {
+            break;
+        }
+        if (!ListView_GetItemRect(group->hListView, 0, &rcFirst, LVIR_BOUNDS))
+        {
+            break;
+        }
+
+        // 第 columns 项（0 基索引，即第 columns+1 个）若不在首行，说明实际列数不足
+        if (rcItem.top <= rcFirst.top)
+        {
+            // 同一行，实际列数已满足设定
+            break;
+        }
+
+        // 实测前两列的横向间距，用它反推每列真实占位
+        actualColumns = 0;
+        if (ListView_GetItemRect(group->hListView, 1, &rcSecond, LVIR_BOUNDS))
+        {
+            actualColumns = rcSecond.left - rcFirst.left;
+        }
+        if (actualColumns <= 0)
+        {
+            actualColumns = spacingCx;
+        }
+
+        // 让前 columns 项排进同一行：客户区宽度需容纳 columns * 实际占位
+        RECT rcClient;
+        GetClientRect(group->hListView, &rcClient);
+        needCx = rcFirst.left + columns * actualColumns + 8 - rcClient.right;
+        if (needCx <= 0)
+        {
+            break;
+        }
+
+        RECT rcWnd;
+        GetWindowRect(group->hWnd, &rcWnd);
+        SetWindowPos(
+            group->hWnd,
+            NULL,
+            0,
+            0,
+            (rcWnd.right - rcWnd.left) + needCx,
+            rcWnd.bottom - rcWnd.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+        );
+        LauncherGroups_ResizeAppsListView(group);
+    }
 }
 
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group)

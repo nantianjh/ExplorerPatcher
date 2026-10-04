@@ -1055,6 +1055,9 @@ POINT g_launcherGroupsDragStartPt = { 0, 0 };
 HWND g_launcherGroupsTaskbarWnd = NULL;
 DWORD g_launcherGroupsLastDragCheckTick = 0;
 BOOL g_launcherGroupsDragMoved = FALSE;
+// 诊断埋点：只用于区分"拖动消息没到达"与"到达了但状态已被清"，无行为影响。
+BOOL g_launcherGroupsItemDragMoveLogged = FALSE;
+int g_launcherGroupsTaskbarDragSeq = 0;
 
 void LauncherGroups_UpdateAppsWindow(LauncherGroup* group);
 void LauncherGroups_PositionAppsWindow(LauncherGroup* group);
@@ -1950,6 +1953,10 @@ BOOL LauncherGroups_OnTaskbarLeftButton(POINT pt, BOOL bButtonDown)
             g_launcherGroupsTaskbarWnd = WindowFromPoint(pt);
         }
         SetCapture(g_launcherGroupsTaskbarWnd);
+        g_launcherGroupsTaskbarDragSeq++;
+        EPDebugLogWrite(
+            L"launcher-group taskbar drag down seq=%d group=\"%s\" taskbarWnd=%p captureAfter=%p",
+            g_launcherGroupsTaskbarDragSeq, group->szName, g_launcherGroupsTaskbarWnd, GetCapture());
         // 左键从此专职拖动：不再记录"待弹菜单"。
         // 菜单统一挪到右键（见钩子的 WM_RBUTTONUP 分支），
         // 原先"释放时位移<4px 补弹菜单"的逻辑会让左键语义歧义——
@@ -1971,6 +1978,14 @@ BOOL LauncherGroups_FinishTaskbarDrag()
     GetCursorPos(&releasePt);
     dx = releasePt.x - startPt.x;
     dy = releasePt.y - startPt.y;
+
+    // 留证：判定"无响应"的关键三要素——按下的分组、找到的目标、实际位移。
+    // 若 target 恒为 NULL 而 moved=1，则问题在 FindGroupAtPoint（UIA 命中判定），
+    // 而非捕获或消息派发；这三种可能必须靠日志区分，不能靠推测。
+    EPDebugLogWrite(
+        L"launcher-group taskbar drag up seq=%d moved=%d from=%d,%d to=%d,%d target=\"%s\"",
+        g_launcherGroupsTaskbarDragSeq, bMoved, startPt.x, startPt.y, releasePt.x, releasePt.y,
+        target ? target->szName : L"(none)");
 
     g_launcherGroupsDragActive = FALSE;
     g_launcherGroupsDragGroup = NULL;
@@ -4844,6 +4859,16 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             pt.y = GET_Y_LPARAM(lParam);
             ClientToScreen(hWnd, &pt);
             target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            if (!g_launcherGroupsItemDragMoveLogged)
+            {
+                // 首条移动即打点：证明捕获确实回到了 ListView 子类。
+                // 若此行始终缺失，说明 WM_MOUSEMOVE 根本没进子类，
+                // 即LVN_BEGINDRAG 里的 SetCapture 之后捕获又被系统/ListView 夺走。
+                g_launcherGroupsItemDragMoveLogged = TRUE;
+                EPDebugLogWrite(
+                    L"launcher-group item drag move hwnd=%p target=%d capture=%p",
+                    hWnd, target, GetCapture());
+            }
             if (target >= 0 && target != group->iLastDropTarget)
             {
                 group->iLastDropTarget = target;
@@ -4862,6 +4887,9 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
             pt.y = GET_Y_LPARAM(lParam);
             ClientToScreen(hWnd, &pt);
             target = LauncherGroups_HitTestListViewItemAtPoint(group, pt);
+            EPDebugLogWrite(
+                L"launcher-group item drag up hwnd=%p from=%d target=%d capture=%p",
+                hWnd, group->iDragItem, target, GetCapture());
             ReleaseCapture();
             group->bDragActive = FALSE;
             if (target >= 0 && target < (int)group->cItems && target != group->iDragItem)
@@ -4874,7 +4902,14 @@ static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
         }
         if (uMsg == WM_CAPTURECHANGED && group->bDragActive)
         {
-            // 捕获被系统或ListView 抢走：结束拖动，避免状态卡在TRUE
+            // 捕获被系统或ListView 抢走：结束拖动，避免状态卡在TRUE。
+            // 必须留证：lParam 是"抢走捕获的新窗口"，为0 表示是本窗口自己
+            // ReleaseCapture 导致的（WM_CAPTURECHANGED 文档：窗口自己调用
+            // ReleaseCapture 也会收到本消息）。若 lParam=0 且我方并未 Release，
+            // 说明是别处抢走了捕获，WM_LBUTTONUP 永远不会到达子类。
+            EPDebugLogWrite(
+                L"launcher-group item drag capture lost newOwner=%p from=%d",
+                (HWND)lParam, group->iDragItem);
             group->bDragActive = FALSE;
             group->iDragItem = -1;
             group->iLastDropTarget = -1;
@@ -5052,17 +5087,24 @@ LRESULT CALLBACK LauncherGroups_WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPA
                 group->bDragActive = group->iDragItem >= 0 && group->iDragItem < (int)group->cItems;
                 group->bSuppressNextClick = group->bDragActive;
                 group->dwSuppressClickUntil = GetTickCount() + 500;
+                g_launcherGroupsItemDragMoveLogged = FALSE;
                 if (group->bDragActive)
                 {
+                    HWND hList = group->hListView ? group->hListView : hWnd;
                     // 必须捕获到 ListView 本身：按下发生在子窗口上，若捕获父窗口，
                     // ListView 仍会在拖动开始时抢回捕获并截走后续鼠标消息。
-                    SetCapture(group->hListView ? group->hListView : hWnd);
-                    EPDebugLogWrite(L"launcher-group drag begin group=\"%s\" index=%d", group->szName, group->iDragItem);
+                    SetCapture(hList);
+                    // 记录 SetCapture 的真实结果与返回值，供日志判定捕获是否落到我方窗口。
+                    EPDebugLogWrite(
+                        L"launcher-group drag begin group=\"%s\" index=%d list=%p captureAfter=%p",
+                        group->szName, group->iDragItem, hList, GetCapture());
                 }
-                // 必须返回非 0 抑制 ListView 自带的拖动：否则 ListView 会继续走它自己的
-                // 拖动流程并重新捕获鼠标，本窗口的 WM_LBUTTONUP 永远不会到达，
-                // WM_MOUSEMOVE/WM_LBUTTONUP 里的换位逻辑成了死代码。
-                return group->bDragActive ? 1 : 0;
+                // 官方文档：LVN_BEGINDRAG **没有返回值**（"No return value"），
+                // 它是纯通知而非可 veto 的请求。因此这里返回什么都不会抑制
+                // ListView 自带的拖动流程 —— 上一轮"返回非 0 来抑制"的假设不成立。
+                // 真正需要的是下面这段：既然抑制不了，就让ListView 把捕获抢走，
+                // 由 ListViewSubclassProc 在 ListView 窗口上接管后续鼠标消息。
+                return 0;
             }
             if (hdr->code == LVN_KEYDOWN)
             {

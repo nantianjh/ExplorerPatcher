@@ -2824,11 +2824,12 @@ void LauncherGroups_ApplyAppsFont(LauncherGroup* group)
     }
 }
 
-BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group);
 // 前置声明：ListView 子类在下方定义，但 EnsureAppsListView 里就要挂上去。
 static LRESULT CALLBACK LauncherGroups_ListViewSubclassProc(
     _In_ HWND hWnd, _In_ UINT uMsg, _In_ WPARAM wParam, _In_ LPARAM lParam,
     _In_ UINT_PTR uIdSubclass, _In_ DWORD_PTR dwRefData);
+
+BOOL LauncherGroups_EnsureAppsListView(HWND hWnd, LauncherGroup* group)
 {
     if (!group || !hWnd)
     {
